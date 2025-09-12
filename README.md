@@ -997,15 +997,6 @@ SOFTWARE.
 
 ---
 
-## 🙏 Подяки
-
-### Основні розробники
-- **@username** - Ідея та архітектура проекту
-- **@contributor1** - Система безпеки та авторизації
-- **@contributor2** - Discord API інтеграція
-- **@contributor3** - Telegram Bot UI/UX
-
-### Бібліотеки та інструменти
 
 Величезна подяка авторам цих проектів:
 
@@ -1014,47 +1005,11 @@ SOFTWARE.
 - **[python-dotenv](https://github.com/theskumar/python-dotenv)** - Завантаження змінних середовища
 - **[bcrypt](https://github.com/pyca/bcrypt/)** - Хешування паролів
 
-### Спільнота
 
-Подяка всім користувачам, які:
-- 🐛 Повідомили про помилки
-- 💡 Запропонували покращення
-- 📖 Покращили документацію
-- ⭐ Поставили зірочку проекту
-
----
-
-## 📞 Підтримка та контакти
-
-### Отримання допомоги
-
-- 📚 **Документація**: Перевірте цей README та файли в папці `docs/`
-- 🐛 **Баг репорти**: Створіть [Issue](https://github.com/username/repo/issues)
-- 💬 **Питання**: Використайте [Discussions](https://github.com/username/repo/discussions)
-- 📧 **Email**: support@example.com (тільки для критичних проблем)
-
-### Соціальні мережі
-
-- 🐦 **Twitter**: [@discordmonitorbot](https://twitter.com/discordmonitorbot)
-- 💬 **Telegram**: [@discord_monitor_chat](https://t.me/discord_monitor_chat)
-- 💻 **GitHub**: [Репозиторій проекту](https://github.com/username/telegram-discord-monitor)
-
-### Статистика проекту
-
-![GitHub stars](https://img.shields.io/github/stars/username/telegram-discord-monitor?style=social)
-![GitHub forks](https://img.shields.io/github/forks/username/telegram-discord-monitor?style=social)
-![GitHub issues](https://img.shields.io/github/issues/username/telegram-discord-monitor)
-![GitHub pull requests](https://img.shields.io/github/issues-pr/username/telegram-discord-monitor)
-![GitHub contributors](https://img.shields.io/github/contributors/username/telegram-discord-monitor)
-
----
-
-<div align="center">
-  
-**Зроблено з ❤️ українською спільнотою розробників**
 
 *Якщо цей проект допоміг вам, поставте ⭐ зірочку!*
 
 [⬆️ Повернутися до змісту](#-зміст)
 
 </div>
+
