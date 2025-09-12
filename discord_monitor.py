@@ -19,8 +19,11 @@ class DiscordMonitor:
         self.session = aiohttp.ClientSession(
             headers={
                 'Authorization': self.authorization,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+                'User-Agent': 'DiscordBot (https://github.com/discord/discord-api-docs, 1.0)',
+                'Content-Type': 'application/json',
+                'X-RateLimit-Precision': 'millisecond'
+            },
+            timeout=aiohttp.ClientTimeout(total=10)
         )
         return self
         
@@ -54,14 +57,21 @@ class DiscordMonitor:
         self.last_message_ids.pop(channel_id, None)
         self.logger.info(f"Видалено канал з моніторингу: {channel_id}")
         
-    async def get_channel_messages(self, channel_id: str, limit: int = 1) -> List[Dict]:
-        """Отримати останні повідомлення з каналу"""
+    async def get_channel_messages(self, channel_id: str, limit: int = 5) -> List[Dict]:
+        """Отримати повідомлення з каналу (безпечно)"""
         if not self.session:
             return []
             
         try:
             url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit={limit}"
             async with self.session.get(url) as response:
+                # Перевіряємо rate limit
+                if response.status == 429:
+                    retry_after = float(response.headers.get('Retry-After', 1))
+                    self.logger.warning(f"Rate limited, чекаємо {retry_after} секунд")
+                    await asyncio.sleep(retry_after)
+                    return await self.get_channel_messages(channel_id, limit)
+                
                 if response.status == 200:
                     messages = await response.json()
                     return messages
@@ -81,8 +91,12 @@ class DiscordMonitor:
         """Перевірити нові повідомлення у всіх каналах (виправлено)"""
         new_messages = []
         
-        for channel_id in self.monitoring_channels:
+        for i, channel_id in enumerate(self.monitoring_channels):
             try:
+                # Додаємо затримку між запитами до різних каналів
+                if i > 0:
+                    await asyncio.sleep(1)  # 1 секунда між каналами
+                
                 # Отримуємо повідомлення
                 messages = await self.get_channel_messages(channel_id, limit=5)
                 if not messages:
@@ -129,8 +143,8 @@ class DiscordMonitor:
                 
         return new_messages
         
-    async def start_monitoring(self, callback_func, interval: int = 5):
-        """Запустити моніторинг з callback функцією (оптимізовано)"""
+    async def start_monitoring(self, callback_func, interval: int = 15):
+        """Запустити моніторинг з callback функцією (безпечно)"""
         while True:
             try:
                 new_messages = await self.check_new_messages()
@@ -143,11 +157,15 @@ class DiscordMonitor:
                     else:
                         callback_func(new_messages)
                     
-                await asyncio.sleep(interval)
+                # Додаємо випадкову затримку для уникнення підозрілої активності
+                import random
+                random_delay = random.uniform(0.5, 2.0)
+                await asyncio.sleep(interval + random_delay)
                 
             except Exception as e:
                 self.logger.error(f"Помилка в циклі моніторингу: {e}")
-                await asyncio.sleep(interval)
+                # При помилці чекаємо довше
+                await asyncio.sleep(interval * 2)
                 
     def get_monitoring_status(self) -> Dict:
         """Отримати статус моніторингу"""
