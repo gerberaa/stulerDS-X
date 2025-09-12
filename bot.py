@@ -8,7 +8,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from security_manager import SecurityManager
 from project_manager import ProjectManager
 from discord_monitor import DiscordMonitor
-from config import BOT_TOKEN, ADMIN_PASSWORD, SECURITY_TIMEOUT, MESSAGES, DISCORD_AUTHORIZATION, MONITORING_INTERVAL
+from twitter_monitor import TwitterMonitor
+from selenium_twitter_monitor import SeleniumTwitterMonitor
+from config import BOT_TOKEN, ADMIN_PASSWORD, SECURITY_TIMEOUT, MESSAGES, DISCORD_AUTHORIZATION, MONITORING_INTERVAL, TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN, TWITTER_MONITORING_INTERVAL
 
 # Налаштування логування - тільки критичні помилки для швидкості
 logging.basicConfig(
@@ -21,6 +23,8 @@ logger = logging.getLogger(__name__)
 security_manager = SecurityManager(SECURITY_TIMEOUT)
 project_manager = ProjectManager()
 discord_monitor = DiscordMonitor(DISCORD_AUTHORIZATION) if DISCORD_AUTHORIZATION else None
+twitter_monitor = TwitterMonitor(TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN) if TWITTER_AUTH_TOKEN else None
+selenium_twitter_monitor = None  # Ініціалізується при потребі
 
 # Словник для зберігання стану користувачів (очікують пароль)
 waiting_for_password = {}
@@ -36,7 +40,9 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("➕ Додати проект", callback_data="add_project")],
         [InlineKeyboardButton("📋 Мої проекти", callback_data="my_projects")],
+        [InlineKeyboardButton("🔧 Менеджер акаунтів", callback_data="account_manager")],
         [InlineKeyboardButton("📜 Історія Discord", callback_data="discord_history")],
+        [InlineKeyboardButton("🐦 Selenium Twitter", callback_data="selenium_twitter")],
         [InlineKeyboardButton("📢 Пересилання", callback_data="forward_settings")],
         [InlineKeyboardButton("🔧 Діагностика", callback_data="diagnostics")],
         [InlineKeyboardButton("⚙️ Налаштування", callback_data="settings")],
@@ -115,6 +121,36 @@ def escape_markdown(text: str) -> str:
     if not text:
         return ""
     return str(text).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
+
+def extract_twitter_username(url: str) -> str:
+    """Витягти username з Twitter URL"""
+    try:
+        # Підтримуємо різні формати URL
+        if 'twitter.com' in url or 'x.com' in url:
+            # Видаляємо протокол
+            url = url.replace('https://', '').replace('http://', '')
+            
+            # Видаляємо www
+            if url.startswith('www.'):
+                url = url[4:]
+                
+            # Витягуємо username
+            if url.startswith('twitter.com/'):
+                username = url.split('/')[1]
+            elif url.startswith('x.com/'):
+                username = url.split('/')[1]
+            else:
+                return None
+                
+            # Очищаємо від зайвих символів
+            username = username.split('?')[0].split('#')[0]
+            
+            return username if username else None
+            
+        return None
+    except Exception as e:
+        logger.error(f"Помилка витягування Twitter username: {e}")
+        return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник команди /start"""
@@ -302,6 +338,76 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             help_text,
             reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    elif callback_data == "selenium_twitter":
+        selenium_text = (
+            "🐦 **Selenium Twitter Моніторинг**\n\n"
+            "🔧 **Доступні команди:**\n"
+            "• `/selenium_auth` - Авторизація в Twitter\n"
+            "• `/selenium_add username` - Додати акаунт\n"
+            "• `/selenium_test username` - Тестувати моніторинг\n"
+            "• `/selenium_start` - Запустити моніторинг\n"
+            "• `/selenium_stop` - Зупинити моніторинг\n\n"
+            "📝 **Приклад використання:**\n"
+            "1. `/selenium_auth` - увійдіть в Twitter\n"
+            "2. `/selenium_add pilk_xz` - додайте акаунт\n"
+            "3. `/selenium_test pilk_xz` - протестуйте\n"
+            "4. `/selenium_start` - запустіть моніторинг\n\n"
+            "💡 **Переваги Selenium:**\n"
+            "• Реальний браузер\n"
+            "• Авторизований доступ\n"
+            "• Надійний парсинг\n"
+            "• Обхід обмежень API"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
+        await query.edit_message_text(
+            selenium_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    elif callback_data == "account_manager":
+        # Показуємо менеджер акаунтів
+        projects = project_manager.get_user_projects(user_id)
+        
+        if not projects:
+            await query.edit_message_text(
+                "🔧 **Менеджер акаунтів**\n\n❌ У вас немає проектів для моніторингу.\n\nДодайте проекти через меню бота.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return
+        
+        # Групуємо по платформах
+        twitter_projects = [p for p in projects if p['platform'] == 'twitter']
+        discord_projects = [p for p in projects if p['platform'] == 'discord']
+        
+        # Форматуємо список
+        text = "🔧 **Менеджер акаунтів**\n\n"
+        
+        if twitter_projects:
+            text += "🐦 **Twitter/X акаунти:**\n"
+            for i, project in enumerate(twitter_projects, 1):
+                username = extract_twitter_username(project['url'])
+                text += f"{i}. @{username} ({project['name']})\n"
+            text += "\n"
+        
+        if discord_projects:
+            text += "💬 **Discord канали:**\n"
+            for i, project in enumerate(discord_projects, 1):
+                channel_id = extract_discord_channel_id(project['url'])
+                text += f"{i}. Канал {channel_id} ({project['name']})\n"
+            text += "\n"
+        
+        # Додаємо команди для видалення
+        text += "🔧 **Команди для управління:**\n"
+        text += "• /remove_twitter username - видалити Twitter акаунт\n"
+        text += "• /remove_discord channel_id - видалити Discord канал\n"
+        text += "• /accounts - показати список акаунтів"
+        
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
     elif callback_data == "discord_history":
         # Перевіряємо чи є Discord проекти
@@ -670,13 +776,22 @@ async def handle_project_creation(update: Update, context: ContextTypes.DEFAULT_
         
         # Додаємо проект
         if project_manager.add_project(user_id, state_data):
-            # Якщо це Discord проект, додаємо до моніторингу
+            # Додаємо до відповідного моніторингу
             if state_data['platform'] == 'discord' and discord_monitor:
                 try:
                     discord_monitor.add_channel(state_data['url'])
                     logger.info(f"Додано Discord канал до моніторингу: {state_data['url']}")
                 except Exception as e:
                     logger.error(f"Помилка додавання Discord каналу до моніторингу: {e}")
+            elif state_data['platform'] == 'twitter' and twitter_monitor:
+                try:
+                    # Витягуємо username з URL
+                    username = extract_twitter_username(state_data['url'])
+                    if username:
+                        twitter_monitor.add_account(username)
+                        logger.info(f"Додано Twitter акаунт до моніторингу: {username}")
+                except Exception as e:
+                    logger.error(f"Помилка додавання Twitter акаунта до моніторингу: {e}")
                     
             success_text = (
                 f"🎉 Проект успішно додано!\n\n"
@@ -963,18 +1078,46 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
             message_id = message.get('message_id', '')
             channel_id = message.get('channel_id', '')
             
-            # Швидке форматування
+            # Красиве форматування
             author = escape_markdown(message['author'])
-            content = escape_markdown(message['content'][:300])
-            if len(message['content']) > 300:
-                content += '...'
+            content = escape_markdown(message['content'])
+            
+            # Обрізаємо текст якщо він занадто довгий
+            if len(content) > 200:
+                content = content[:200] + "..."
+            
+            # Форматуємо дату
+            timestamp = message.get('timestamp', '')
+            formatted_date = "Не відомо"
+            time_ago = ""
+            
+            if timestamp:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    formatted_date = dt.strftime("%d %B, %H:%M UTC")
+                    time_ago = _get_time_ago(dt)
+                except:
+                    formatted_date = timestamp[:19] if len(timestamp) > 19 else timestamp
+            
+            # Отримуємо інформацію про сервер з URL
+            server_name = "Discord"
+            try:
+                # Спробуємо витягти guild_id з URL
+                url_parts = message['url'].split('/')
+                if len(url_parts) >= 5:
+                    guild_id = url_parts[4]
+                    server_name = f"Discord Server ({guild_id})"
+            except:
+                pass
             
             forward_text = (
-                f"📢 **Нове повідомлення з Discord**\n\n"
-                f"👤 Автор: {author}\n"
-                f"📝 Текст: {content}\n"
-                f"🔗 [Перейти до повідомлення]({message['url']})\n\n"
-                f"⏰ {message['timestamp'][:19] if message['timestamp'] else 'Невідомо'}"
+                f"📢 **Нове повідомлення з Discord**\n"
+                f"• Сервер: {server_name}\n"
+                f"• Автор: {author}\n"
+                f"• Дата: {formatted_date} ({time_ago})\n"
+                f"• Текст: {content}\n"
+                f"🔗 [Перейти до повідомлення]({message['url']})"
             )
             
             for user_id in users_with_forwarding:
@@ -1011,6 +1154,96 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
     except Exception as e:
         logger.error(f"Помилка обробки Discord сповіщень: {e}")
 
+def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
+    """Обробник нових твітів Twitter (оптимізована версія)"""
+    global bot_instance
+    
+    if not bot_instance:
+        return
+        
+    try:
+        # Отримуємо всіх користувачів з налаштованими каналами пересилання
+        all_users = project_manager.get_all_users()
+        users_with_forwarding = []
+        
+        for user_id in all_users:
+            forward_channel = project_manager.get_forward_channel(user_id)
+            if forward_channel:
+                users_with_forwarding.append(user_id)
+        
+        if not users_with_forwarding:
+            return
+                
+        # Швидка обробка твітів
+        for tweet in new_tweets:
+            tweet_id = tweet.get('tweet_id', '')
+            account = tweet.get('account', '')
+            
+            # Красиве форматування
+            author = escape_markdown(tweet.get('author', 'Unknown'))
+            text = escape_markdown(tweet.get('text', ''))
+            
+            # Обрізаємо текст якщо він занадто довгий
+            if len(text) > 200:
+                text = text[:200] + "..."
+            
+            # Форматуємо дату
+            timestamp = tweet.get('timestamp', '')
+            formatted_date = "Не відомо"
+            time_ago = ""
+            
+            if timestamp:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    formatted_date = dt.strftime("%d %B, %H:%M UTC")
+                    time_ago = _get_time_ago(dt)
+                except:
+                    formatted_date = timestamp[:19] if len(timestamp) > 19 else timestamp
+            
+            forward_text = (
+                f"🐦 **Новий твіт з Twitter**\n"
+                f"• Профіль: @{account}\n"
+                f"• Автор: {author}\n"
+                f"• Дата: {formatted_date} ({time_ago})\n"
+                f"• Текст: {text}\n"
+                f"🔗 [Перейти до твіта]({tweet.get('url', '')})"
+            )
+            
+            for user_id in users_with_forwarding:
+                try:
+                    # Швидка перевірка каналу
+                    forward_channel = project_manager.get_forward_channel(user_id)
+                    if not forward_channel:
+                        continue
+                    
+                    # Швидка перевірка дублікатів
+                    forward_key = f"twitter_{account}_{tweet_id}"
+                    if project_manager.is_message_sent(forward_key, forward_channel, user_id):
+                        continue
+                    
+                    # Швидка відправка
+                    import requests
+                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                    data = {
+                        'chat_id': forward_channel,
+                        'text': forward_text,
+                        'parse_mode': 'Markdown'
+                    }
+                    response = requests.post(url, data=data, timeout=3)
+                    
+                    if response.status_code == 200:
+                        project_manager.add_sent_message(forward_key, forward_channel, user_id)
+                        logger.info(f"✅ Переслано Twitter твіт в канал {forward_channel} (користувач {user_id})")
+                    else:
+                        logger.error(f"❌ Помилка відправки Twitter твіта в канал {forward_channel}: {response.status_code}")
+                    
+                except Exception as e:
+                    logger.error(f"Помилка обробки Twitter користувача {user_id}: {e}")
+                    
+    except Exception as e:
+        logger.error(f"Помилка обробки Twitter сповіщень: {e}")
+
 async def start_discord_monitoring():
     """Запустити моніторинг Discord"""
     global discord_monitor
@@ -1033,6 +1266,105 @@ async def start_discord_monitoring():
     except Exception as e:
         logger.error(f"Помилка моніторингу Discord: {e}")
 
+async def start_twitter_monitoring():
+    """Запустити моніторинг Twitter з покращеним HTML парсингом"""
+    global twitter_monitor
+    
+    if not twitter_monitor or not TWITTER_AUTH_TOKEN:
+        logger.warning("Twitter auth_token не налаштовано")
+        return
+        
+    try:
+        async with twitter_monitor:
+            # Додаємо всі Twitter акаунти з проектів користувачів
+            for user_id, projects in project_manager.data['projects'].items():
+                for project in projects:
+                    if project['platform'] == 'twitter':
+                        username = extract_twitter_username(project['url'])
+                        if username:
+                            twitter_monitor.add_account(username)
+                            
+            logger.info(f"Запуск моніторингу Twitter акаунтів з HTML парсингом")
+            
+            # Запускаємо власний цикл моніторингу з HTML парсингом
+            while True:
+                try:
+                    # Отримуємо нові твіти через покращений HTML парсинг
+                    new_tweets = await twitter_monitor.check_new_tweets()
+                    
+                    if new_tweets:
+                        # Конвертуємо формат для сумісності з існуючим кодом
+                        formatted_tweets = []
+                        for tweet in new_tweets:
+                            formatted_tweets.append({
+                                'tweet_id': tweet.get('id', ''),
+                                'account': tweet.get('user', {}).get('screen_name', ''),
+                                'author': tweet.get('user', {}).get('name', ''),
+                                'text': tweet.get('text', ''),
+                                'url': tweet.get('url', ''),
+                                'timestamp': tweet.get('created_at', '')
+                            })
+                        
+                        # Відправляємо сповіщення
+                        handle_twitter_notifications_sync(formatted_tweets)
+                        logger.info(f"Оброблено {len(formatted_tweets)} нових твітів")
+                    
+                    # Чекаємо перед наступною перевіркою
+                    await asyncio.sleep(TWITTER_MONITORING_INTERVAL)
+                    
+                except Exception as e:
+                    logger.error(f"Помилка в циклі моніторингу Twitter: {e}")
+                    await asyncio.sleep(30)  # Коротша затримка при помилці
+            
+    except Exception as e:
+        logger.error(f"Помилка моніторингу Twitter: {e}")
+
+async def start_selenium_twitter_monitoring():
+    """Запустити Selenium Twitter моніторинг"""
+    global selenium_twitter_monitor
+    
+    if not selenium_twitter_monitor:
+        logger.warning("Selenium Twitter монітор не ініціалізовано")
+        return
+        
+    try:
+        selenium_twitter_monitor.monitoring_active = True
+        
+        logger.info(f"Запуск Selenium моніторингу Twitter акаунтів: {list(selenium_twitter_monitor.monitoring_accounts)}")
+        
+        # Основний цикл моніторингу
+        while selenium_twitter_monitor.monitoring_active:
+            try:
+                # Отримуємо нові твіти через Selenium
+                new_tweets = await selenium_twitter_monitor.check_new_tweets()
+                
+                if new_tweets:
+                    # Конвертуємо формат для сумісності з існуючим кодом
+                    formatted_tweets = []
+                    for tweet in new_tweets:
+                        formatted_tweets.append({
+                            'tweet_id': tweet.get('id', ''),
+                            'account': tweet.get('user', {}).get('screen_name', ''),
+                            'author': tweet.get('user', {}).get('name', ''),
+                            'text': tweet.get('text', ''),
+                            'url': tweet.get('url', ''),
+                            'timestamp': tweet.get('created_at', '')
+                        })
+                    
+                    # Відправляємо сповіщення
+                    handle_twitter_notifications_sync(formatted_tweets)
+                    logger.info(f"Selenium: оброблено {len(formatted_tweets)} нових твітів")
+                
+                # Чекаємо перед наступною перевіркою
+                await asyncio.sleep(30)
+                
+            except Exception as e:
+                logger.error(f"Помилка в циклі Selenium моніторингу Twitter: {e}")
+                await asyncio.sleep(30)  # Коротша затримка при помилці
+            
+    except Exception as e:
+        logger.error(f"Помилка Selenium моніторингу Twitter: {e}")
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник помилок"""
     logger.error(f"Update {update} caused error {context.error}")
@@ -1050,6 +1382,270 @@ def cleanup_old_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
         project_manager.cleanup_old_messages(hours=24)
     except Exception as e:
         logger.error(f"Помилка очищення старих повідомлень: {e}")
+
+def _get_time_ago(dt: datetime) -> str:
+    """Отримати час тому"""
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        
+        # Переконуємося що dt має timezone
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        
+        diff = now - dt
+        
+        total_seconds = int(diff.total_seconds())
+        
+        if total_seconds < 0:
+            return "щойно"
+        elif total_seconds < 60:
+            return f"{total_seconds} секунд тому"
+        elif total_seconds < 3600:
+            minutes = total_seconds // 60
+            return f"{minutes} хвилин тому"
+        elif total_seconds < 86400:
+            hours = total_seconds // 3600
+            return f"{hours} годин тому"
+        else:
+            days = total_seconds // 86400
+            return f"{days} днів тому"
+    except Exception as e:
+        logger.error(f"Помилка обчислення часу: {e}")
+        return ""
+
+# Selenium Twitter команди
+async def selenium_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для ручної авторизації в Twitter через Selenium"""
+    global selenium_twitter_monitor
+    
+    if not selenium_twitter_monitor:
+        selenium_twitter_monitor = SeleniumTwitterMonitor()
+        await selenium_twitter_monitor.__aenter__()
+    
+    await update.message.reply_text("🔐 Відкриваю браузер для авторизації в Twitter...")
+    
+    try:
+        if selenium_twitter_monitor.open_manual_auth():
+            selenium_twitter_monitor.save_profile()
+            await update.message.reply_text("✅ Авторизація завершена! Профіль збережено.")
+        else:
+            await update.message.reply_text("❌ Помилка відкриття авторизації")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Помилка авторизації: {str(e)}")
+
+async def selenium_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Додати акаунт для Selenium моніторингу"""
+    global selenium_twitter_monitor
+    
+    if not context.args:
+        await update.message.reply_text("❌ Вкажіть username Twitter акаунта!\n\n**Приклад:** /selenium_add pilk_xz")
+        return
+    
+    username = context.args[0].replace('@', '').strip()
+    
+    if not selenium_twitter_monitor:
+        selenium_twitter_monitor = SeleniumTwitterMonitor()
+        await selenium_twitter_monitor.__aenter__()
+    
+    if selenium_twitter_monitor.add_account(username):
+        await update.message.reply_text(f"✅ Додано Twitter акаунт для Selenium моніторингу: @{username}")
+    else:
+        await update.message.reply_text(f"❌ Помилка додавання акаунта: @{username}")
+
+async def selenium_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Тестувати Selenium моніторинг"""
+    global selenium_twitter_monitor
+    
+    if not context.args:
+        await update.message.reply_text("❌ Вкажіть username Twitter акаунта!\n\n**Приклад:** /selenium_test pilk_xz")
+        return
+    
+    username = context.args[0].replace('@', '').strip()
+    
+    if not selenium_twitter_monitor:
+        selenium_twitter_monitor = SeleniumTwitterMonitor()
+        await selenium_twitter_monitor.__aenter__()
+    
+    await update.message.reply_text(f"🔍 Тестування Selenium моніторингу для @{username}...")
+    
+    try:
+        tweets = await selenium_twitter_monitor.get_user_tweets(username, limit=3)
+        
+        if tweets:
+            result_text = f"✅ **Selenium тест успішний!**\n\nЗнайдено {len(tweets)} твітів:\n\n"
+            
+            for i, tweet in enumerate(tweets, 1):
+                text_preview = tweet['text'][:100] + "..." if len(tweet['text']) > 100 else tweet['text']
+                result_text += f"{i}. {text_preview}\n"
+                result_text += f"   🔗 [Перейти]({tweet['url']})\n\n"
+                
+            await update.message.reply_text(result_text, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"❌ Твіти не знайдено для @{username}")
+            
+    except Exception as e:
+        await update.message.reply_text(f"❌ Помилка тестування: {str(e)}")
+
+async def selenium_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запустити Selenium Twitter моніторинг"""
+    global selenium_twitter_monitor
+    
+    if not selenium_twitter_monitor:
+        selenium_twitter_monitor = SeleniumTwitterMonitor()
+        await selenium_twitter_monitor.__aenter__()
+    
+    if not selenium_twitter_monitor.monitoring_accounts:
+        await update.message.reply_text("❌ Немає акаунтів для моніторингу! Додайте Twitter акаунти спочатку.")
+        return
+    
+    # Запускаємо Selenium моніторинг в окремому потоці
+    import threading
+    selenium_thread = threading.Thread(target=lambda: asyncio.run(start_selenium_twitter_monitoring()))
+    selenium_thread.daemon = True
+    selenium_thread.start()
+    
+    await update.message.reply_text("🚀 **Selenium Twitter моніторинг запущено!**\n\nБот буде перевіряти нові твіти кожні 30 секунд.", parse_mode='Markdown')
+
+async def selenium_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Зупинити Selenium Twitter моніторинг"""
+    global selenium_twitter_monitor
+    
+    if selenium_twitter_monitor:
+        selenium_twitter_monitor.monitoring_active = False
+        await selenium_twitter_monitor.__aexit__(None, None, None)
+        selenium_twitter_monitor = None
+    
+    await update.message.reply_text("⏹️ **Selenium Twitter моніторинг зупинено!**", parse_mode='Markdown')
+
+# Менеджер акаунтів
+async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показати всі акаунти для моніторингу"""
+    user_id = update.effective_user.id
+    
+    # Отримуємо проекти користувача
+    projects = project_manager.get_user_projects(user_id)
+    
+    if not projects:
+        await update.message.reply_text("❌ У вас немає проектів для моніторингу.\n\nДодайте проекти через меню бота.")
+        return
+    
+    # Групуємо по платформах
+    twitter_projects = [p for p in projects if p['platform'] == 'twitter']
+    discord_projects = [p for p in projects if p['platform'] == 'discord']
+    
+    # Форматуємо список
+    text = "📋 **Ваші акаунти для моніторингу:**\n\n"
+    
+    if twitter_projects:
+        text += "🐦 **Twitter/X акаунти:**\n"
+        for i, project in enumerate(twitter_projects, 1):
+            username = extract_twitter_username(project['url'])
+            text += f"{i}. @{username} ({project['name']})\n"
+        text += "\n"
+    
+    if discord_projects:
+        text += "💬 **Discord канали:**\n"
+        for i, project in enumerate(discord_projects, 1):
+            channel_id = extract_discord_channel_id(project['url'])
+            text += f"{i}. Канал {channel_id} ({project['name']})\n"
+        text += "\n"
+    
+    # Додаємо команди для видалення
+    text += "🔧 **Команди для управління:**\n"
+    text += "• /remove_twitter username - видалити Twitter акаунт\n"
+    text += "• /remove_discord channel_id - видалити Discord канал\n"
+    text += "• /accounts - показати цей список"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def remove_twitter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Видалити Twitter акаунт з моніторингу"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text("❌ Вкажіть username Twitter акаунта!\n\n**Приклад:** /remove_twitter pilk_xz")
+        return
+    
+    username = context.args[0].replace('@', '').strip()
+    
+    # Знаходимо проект для видалення
+    projects = project_manager.get_user_projects(user_id)
+    twitter_projects = [p for p in projects if p['platform'] == 'twitter']
+    
+    project_to_remove = None
+    for project in twitter_projects:
+        if extract_twitter_username(project['url']) == username:
+            project_to_remove = project
+            break
+    
+    if not project_to_remove:
+        await update.message.reply_text(f"❌ Twitter акаунт @{username} не знайдено в ваших проектах.")
+        return
+    
+    # Видаляємо проект
+    if project_manager.remove_project(user_id, project_to_remove['name']):
+        await update.message.reply_text(f"✅ Twitter акаунт @{username} видалено з моніторингу.")
+        
+        # Також видаляємо з Selenium монітора якщо він активний
+        global selenium_twitter_monitor
+        if selenium_twitter_monitor and username in selenium_twitter_monitor.monitoring_accounts:
+            selenium_twitter_monitor.monitoring_accounts.discard(username)
+            if username in selenium_twitter_monitor.seen_tweets:
+                del selenium_twitter_monitor.seen_tweets[username]
+            await update.message.reply_text(f"✅ Акаунт @{username} також видалено з Selenium моніторингу.")
+    else:
+        await update.message.reply_text(f"❌ Помилка видалення Twitter акаунта @{username}.")
+
+async def remove_discord_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Видалити Discord канал з моніторингу"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text("❌ Вкажіть ID Discord каналу!\n\n**Приклад:** /remove_discord 1358806016648544326")
+        return
+    
+    channel_id = context.args[0].strip()
+    
+    # Знаходимо проект для видалення
+    projects = project_manager.get_user_projects(user_id)
+    discord_projects = [p for p in projects if p['platform'] == 'discord']
+    
+    project_to_remove = None
+    for project in discord_projects:
+        if extract_discord_channel_id(project['url']) == channel_id:
+            project_to_remove = project
+            break
+    
+    if not project_to_remove:
+        await update.message.reply_text(f"❌ Discord канал {channel_id} не знайдено в ваших проектах.")
+        return
+    
+    # Видаляємо проект
+    if project_manager.remove_project(user_id, project_to_remove['name']):
+        await update.message.reply_text(f"✅ Discord канал {channel_id} видалено з моніторингу.")
+        
+        # Також видаляємо з Discord монітора якщо він активний
+        global discord_monitor
+        if discord_monitor and channel_id in discord_monitor.monitoring_channels:
+            discord_monitor.monitoring_channels.discard(channel_id)
+            if channel_id in discord_monitor.last_message_ids:
+                del discord_monitor.last_message_ids[channel_id]
+            await update.message.reply_text(f"✅ Канал {channel_id} також видалено з Discord моніторингу.")
+    else:
+        await update.message.reply_text(f"❌ Помилка видалення Discord каналу {channel_id}.")
+
+def extract_twitter_username(url: str) -> str:
+    """Витягти username з Twitter URL"""
+    import re
+    match = re.search(r'twitter\.com/([^/?]+)', url)
+    return match.group(1) if match else url
+
+def extract_discord_channel_id(url: str) -> str:
+    """Витягти channel_id з Discord URL"""
+    import re
+    match = re.search(r'discord\.com/channels/\d+/(\d+)', url)
+    return match.group(1) if match else url
 
 def main() -> None:
     """Головна функція"""
@@ -1070,6 +1666,19 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Selenium Twitter команди
+    application.add_handler(CommandHandler("selenium_auth", selenium_auth_command))
+    application.add_handler(CommandHandler("selenium_add", selenium_add_command))
+    application.add_handler(CommandHandler("selenium_test", selenium_test_command))
+    application.add_handler(CommandHandler("selenium_start", selenium_start_command))
+    application.add_handler(CommandHandler("selenium_stop", selenium_stop_command))
+    
+    # Менеджер акаунтів
+    application.add_handler(CommandHandler("accounts", accounts_command))
+    application.add_handler(CommandHandler("remove_twitter", remove_twitter_command))
+    application.add_handler(CommandHandler("remove_discord", remove_discord_command))
+    
     application.add_error_handler(error_handler)
     
     # Додаємо періодичну перевірку сесій (кожну хвилину)
@@ -1084,10 +1693,18 @@ def main() -> None:
     # Запускаємо Discord моніторинг в окремому потоці
     if discord_monitor and DISCORD_AUTHORIZATION:
         import threading
-        monitoring_thread = threading.Thread(target=lambda: asyncio.run(start_discord_monitoring()))
-        monitoring_thread.daemon = True
-        monitoring_thread.start()
+        discord_thread = threading.Thread(target=lambda: asyncio.run(start_discord_monitoring()))
+        discord_thread.daemon = True
+        discord_thread.start()
         logger.info("Discord моніторинг запущено")
+    
+    # Запускаємо Twitter моніторинг в окремому потоці
+    if twitter_monitor and TWITTER_AUTH_TOKEN:
+        import threading
+        twitter_thread = threading.Thread(target=lambda: asyncio.run(start_twitter_monitoring()))
+        twitter_thread.daemon = True
+        twitter_thread.start()
+        logger.info("Twitter моніторинг запущено")
     
     # Запускаємо бота
     try:
