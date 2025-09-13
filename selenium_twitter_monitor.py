@@ -40,9 +40,49 @@ class SeleniumTwitterMonitor:
             os.makedirs(self.profile_path)
             logger.info(f"Створено папку профілю: {self.profile_path}")
         
+        # Автоматично ініціалізуємо драйвер
+        self._setup_driver(headless=True)
+        
+    def _check_chrome_installation(self) -> bool:
+        """Перевірити чи встановлений Chrome"""
+        try:
+            import subprocess
+            import platform
+            
+            if platform.system() == "Windows":
+                # Для Windows перевіряємо через reg
+                try:
+                    result = subprocess.run(['reg', 'query', 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe'], 
+                                         capture_output=True, text=True, timeout=5)
+                    return result.returncode == 0
+                except:
+                    # Альтернативний спосіб для Windows
+                    chrome_paths = [
+                        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                        os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
+                    ]
+                    return any(os.path.exists(path) for path in chrome_paths)
+            else:
+                # Для Linux/Mac
+                try:
+                    result = subprocess.run(['google-chrome', '--version'], capture_output=True, text=True, timeout=5)
+                    return result.returncode == 0
+                except:
+                    try:
+                        result = subprocess.run(['chrome', '--version'], capture_output=True, text=True, timeout=5)
+                        return result.returncode == 0
+                    except:
+                        return False
+        except:
+            return False
+    
     def _setup_driver(self, headless: bool = False) -> bool:
         """Налаштувати Chrome драйвер з профілем"""
         try:
+            # Перевіряємо чи встановлений Chrome
+            if not self._check_chrome_installation():
+                logger.warning("Chrome браузер не знайдено в системі, але спробуємо продовжити...")
             chrome_options = Options()
             
             # Профіль браузера
@@ -59,10 +99,11 @@ class SeleniumTwitterMonitor:
             # User Agent
             chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
             
-            # Відключити зображення для швидкості
+            # Налаштування для підтримки зображень
             prefs = {
-                "profile.managed_default_content_settings.images": 2,
-                "profile.default_content_setting_values.notifications": 2
+                "profile.managed_default_content_settings.images": 1,  # Дозволити зображення
+                "profile.default_content_setting_values.notifications": 2,
+                "profile.managed_default_content_settings.media_stream": 1
             }
             chrome_options.add_experimental_option("prefs", prefs)
             
@@ -73,13 +114,20 @@ class SeleniumTwitterMonitor:
             # Спробуємо використати автоматичний ChromeDriver
             try:
                 self.driver = webdriver.Chrome(options=chrome_options)
+                logger.info("Chrome драйвер успішно ініціалізовано (автоматичний)")
             except Exception as e:
                 logger.warning(f"Не вдалося використати автоматичний ChromeDriver: {e}")
                 # Спробуємо знайти ChromeDriver в поточній папці
                 if os.path.exists("chromedriver.exe"):
-                    service = Service("chromedriver.exe")
-                    self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                    try:
+                        service = Service("chromedriver.exe")
+                        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                        logger.info("Chrome драйвер успішно ініціалізовано (локальний)")
+                    except Exception as e2:
+                        logger.error(f"Не вдалося використати локальний ChromeDriver: {e2}")
+                        raise Exception(f"ChromeDriver не працює: {e2}")
                 else:
+                    logger.error("ChromeDriver не знайдено в поточній папці")
                     raise Exception("ChromeDriver не знайдено")
             
             self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -88,7 +136,19 @@ class SeleniumTwitterMonitor:
             
         except Exception as e:
             logger.error(f"Помилка ініціалізації Chrome драйвера: {e}")
+            self.driver = None
             return False
+    
+    def close_driver(self):
+        """Закрити драйвер"""
+        if self.driver:
+            try:
+                self.driver.quit()
+                logger.info("Selenium драйвер закрито")
+            except Exception as e:
+                logger.error(f"Помилка закриття драйвера: {e}")
+            finally:
+                self.driver = None
     
     async def __aenter__(self):
         """Асинхронний контекстний менеджер"""
@@ -142,11 +202,110 @@ class SeleniumTwitterMonitor:
             tweets = self._extract_tweets_from_page(clean_username)
             logger.info(f"Знайдено {len(tweets)} твітів для {clean_username}")
             
-            return tweets[:limit]
+            # Для кожного твіта з зображеннями відкриваємо його окремо для кращого витягування фото
+            enhanced_tweets = []
+            for tweet in tweets[:limit]:
+                if tweet.get('images'):
+                    # Вже є зображення, додаємо як є
+                    enhanced_tweets.append(tweet)
+                else:
+                    # Спробуємо відкрити твіт окремо для витягування фото
+                    enhanced_tweet = await self._enhance_tweet_with_images(tweet)
+                    enhanced_tweets.append(enhanced_tweet)
+            
+            return enhanced_tweets
             
         except Exception as e:
             logger.error(f"Помилка отримання твітів для {username}: {e}")
             return []
+    
+    async def _enhance_tweet_with_images(self, tweet: Dict) -> Dict:
+        """Відкрити твіт окремо для кращого витягування зображень"""
+        try:
+            tweet_url = tweet.get('url')
+            if not tweet_url:
+                return tweet
+            
+            logger.debug(f"Відкриваємо твіт для витягування фото: {tweet_url}")
+            
+            # Відкриваємо твіт в новій вкладці
+            self.driver.execute_script("window.open('');")
+            self.driver.switch_to.window(self.driver.window_handles[-1])
+            
+            # Переходимо на сторінку твіта
+            self.driver.get(tweet_url)
+            await asyncio.sleep(3)  # Чекаємо завантаження
+            
+            # Шукаємо зображення в відкритому твіті
+            images = self._extract_images_from_opened_tweet()
+            
+            # Закриваємо вкладку та повертаємося до основної
+            self.driver.close()
+            self.driver.switch_to.window(self.driver.window_handles[0])
+            
+            # Додаємо зображення до твіта
+            if images:
+                tweet['images'] = images
+                logger.info(f"Знайдено {len(images)} зображень в відкритому твіті")
+            
+            return tweet
+            
+        except Exception as e:
+            logger.debug(f"Помилка відкриття твіта для витягування фото: {e}")
+            # Повертаємося до основної вкладки якщо щось пішло не так
+            try:
+                if len(self.driver.window_handles) > 1:
+                    self.driver.close()
+                    self.driver.switch_to.window(self.driver.window_handles[0])
+            except:
+                pass
+            return tweet
+    
+    def _extract_images_from_opened_tweet(self) -> List[str]:
+        """Витягти зображення з відкритого твіта"""
+        images = []
+        try:
+            # Селектори для зображень в відкритому твіті
+            selectors = [
+                '[data-testid="tweetPhoto"] img',
+                'div[data-testid="tweetPhoto"] img',
+                '[data-testid="tweetPhoto"] div[style*="background-image"]',
+                'div[data-testid="tweetPhoto"] div[style*="background-image"]',
+                'article img[src*="media"]',
+                'article img[src*="pbs.twimg.com/media"]'
+            ]
+            
+            for selector in selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        # Для img тегів
+                        if element.tag_name == 'img':
+                            src = element.get_attribute('src')
+                            if src and self._is_tweet_image(src):
+                                clean_url = self._clean_image_url(src)
+                                if clean_url and clean_url not in images:
+                                    images.append(clean_url)
+                                    logger.debug(f"Знайдено зображення в відкритому твіті: {clean_url}")
+                        
+                        # Для div з background-image
+                        else:
+                            style = element.get_attribute('style')
+                            if style and 'background-image' in style:
+                                bg_url = self._extract_background_image_url(style)
+                                if bg_url and self._is_tweet_image(bg_url):
+                                    clean_url = self._clean_image_url(bg_url)
+                                    if clean_url and clean_url not in images:
+                                        images.append(clean_url)
+                                        logger.debug(f"Знайдено background зображення: {clean_url}")
+                
+                except Exception as e:
+                    continue
+            
+        except Exception as e:
+            logger.debug(f"Помилка витягування зображень з відкритого твіта: {e}")
+        
+        return images
             
     def _extract_tweets_from_page(self, username: str) -> List[Dict]:
         """Витягти твіти з поточної сторінки"""
@@ -233,14 +392,18 @@ class SeleniumTwitterMonitor:
             except NoSuchElementException:
                 pass
             
-            # Фільтруємо короткі або порожні тексти
-            if len(text) < 5:
+            # Витягуємо фото з твіта
+            images = self._extract_tweet_images(element)
+            
+            # Фільтруємо короткі або порожні тексти (але дозволяємо твіти тільки з фото)
+            if len(text) < 5 and not images:
                 return None
             
             return {
                 'id': tweet_id,
                 'text': text,
                 'url': tweet_url,
+                'images': images,
                 'created_at': datetime.now().isoformat(),
                 'user': {
                     'screen_name': username,
@@ -252,8 +415,139 @@ class SeleniumTwitterMonitor:
             logger.debug(f"Помилка витягування даних твіта: {e}")
             return None
     
+    def _extract_tweet_images(self, element) -> List[str]:
+        """Витягти URL фото з твіта (тільки з поста, не аватарки)"""
+        images = []
+        try:
+            # Селектори для зображень саме в твіті (не аватарки)
+            tweet_image_selectors = [
+                '[data-testid="tweetPhoto"] img',
+                'div[data-testid="tweetPhoto"] img',
+                '[data-testid="tweetPhoto"] div[style*="background-image"]',
+                'div[data-testid="tweetPhoto"] div[style*="background-image"]',
+                '[role="img"][data-testid="tweetPhoto"]',
+                'div[data-testid="tweetPhoto"]',
+                '[data-testid="tweetPhoto"]'
+            ]
+            
+            # Спочатку шукаємо контейнери з зображеннями твіта
+            tweet_photo_containers = []
+            for selector in tweet_image_selectors:
+                try:
+                    containers = element.find_elements(By.CSS_SELECTOR, selector)
+                    tweet_photo_containers.extend(containers)
+                except Exception:
+                    continue
+            
+            # Витягуємо зображення з контейнерів твіта
+            for container in tweet_photo_containers:
+                try:
+                    # Шукаємо img теги в контейнері
+                    img_elements = container.find_elements(By.TAG_NAME, 'img')
+                    for img in img_elements:
+                        src = img.get_attribute('src')
+                        if src and self._is_tweet_image(src):
+                            clean_url = self._clean_image_url(src)
+                            if clean_url and clean_url not in images:
+                                images.append(clean_url)
+                                logger.debug(f"Знайдено зображення твіта: {clean_url}")
+                    
+                    # Шукаємо background-image в стилях
+                    style = container.get_attribute('style')
+                    if style and 'background-image' in style:
+                        bg_url = self._extract_background_image_url(style)
+                        if bg_url and self._is_tweet_image(bg_url):
+                            clean_url = self._clean_image_url(bg_url)
+                            if clean_url and clean_url not in images:
+                                images.append(clean_url)
+                                logger.debug(f"Знайдено зображення з background: {clean_url}")
+                
+                except Exception as e:
+                    continue
+            
+            # Якщо знайшли зображення, логуємо
+            if images:
+                logger.info(f"Знайдено {len(images)} зображень в твіті")
+                
+        except Exception as e:
+            logger.debug(f"Помилка витягування зображень: {e}")
+            
+        return images
+    
+    def _is_tweet_image(self, url: str) -> bool:
+        """Перевірити чи це зображення з твіта (не аватарка)"""
+        if not url:
+            return False
+        
+        # Виключаємо аватарки та інші нерелевантні зображення
+        exclude_patterns = [
+            'profile_images',
+            'avatar',
+            'profile_pic',
+            'default_profile',
+            'default_profile_images',
+            'normal.jpg',
+            'bigger.jpg',
+            'mini.jpg',
+            '400x400',
+            '200x200',
+            '48x48'
+        ]
+        
+        for pattern in exclude_patterns:
+            if pattern in url.lower():
+                return False
+        
+        # Включаємо тільки медіа зображення
+        include_patterns = [
+            'media',
+            'pbs.twimg.com/media',
+            'ton.twimg.com/media'
+        ]
+        
+        for pattern in include_patterns:
+            if pattern in url.lower():
+                return True
+        
+        return False
+    
+    def _clean_image_url(self, url: str) -> str:
+        """Очистити URL зображення та додати параметри для кращого відображення"""
+        if not url:
+            return ""
+        
+        # Видаляємо параметри після ?
+        clean_url = url.split('?')[0]
+        
+        # Видаляємо фрагменти після #
+        clean_url = clean_url.split('#')[0]
+        
+        # Додаємо параметри для кращого відображення в браузері та Telegram
+        if 'pbs.twimg.com/media/' in clean_url:
+            clean_url += '?format=jpg&name=medium'
+        
+        return clean_url
+    
+    def _extract_background_image_url(self, style: str) -> str:
+        """Витягти URL з background-image CSS стилю"""
+        try:
+            import re
+            # Шукаємо url(...) в стилі
+            match = re.search(r'url\(["\']?([^"\']+)["\']?\)', style)
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
+        return ""
+    
     async def check_new_tweets(self) -> List[Dict]:
         """Перевірити нові твіти для всіх акаунтів"""
+        if not self.driver:
+            logger.warning("Selenium драйвер не ініціалізовано, спробуємо ініціалізувати...")
+            if not self._setup_driver(headless=True):
+                logger.error("Не вдалося ініціалізувати Selenium драйвер")
+                return []
+            
         new_tweets = []
         
         for username in self.monitoring_accounts:
@@ -280,6 +574,7 @@ class SeleniumTwitterMonitor:
             url = tweet.get('url', f"https://twitter.com/{username}/status/{tweet_id}")
             created_at = tweet.get('created_at', '')
             text = tweet.get('text', '')
+            images = tweet.get('images', [])
             
             # Форматуємо дату
             try:
@@ -305,6 +600,10 @@ class SeleniumTwitterMonitor:
 • Дата: {formatted_date} ({time_ago})
 • Текст: {text}
 🔗 [Перейти до твіта]({url})"""
+            
+            # Додаємо інформацію про зображення якщо є
+            if images:
+                notification += f"\n📷 Зображень: {len(images)}"
             
             return notification
             

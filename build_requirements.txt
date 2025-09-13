@@ -1,0 +1,11 @@
+# Залежності для компіляції проекту
+pyinstaller>=5.0.0
+upx-ucl>=3.96
+
+# Основні залежності проекту
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+aiohttp==3.9.1
+requests==2.31.0
+selenium==4.15.0
+asyncio

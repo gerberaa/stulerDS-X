@@ -1,6 +1,9 @@
 import logging
 import asyncio
 import threading
+import requests
+import tempfile
+import os
 from datetime import datetime
 from typing import List, Dict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
@@ -10,6 +13,7 @@ from project_manager import ProjectManager
 from discord_monitor import DiscordMonitor
 from twitter_monitor import TwitterMonitor
 from selenium_twitter_monitor import SeleniumTwitterMonitor
+from access_manager import access_manager
 from config import BOT_TOKEN, ADMIN_PASSWORD, SECURITY_TIMEOUT, MESSAGES, DISCORD_AUTHORIZATION, MONITORING_INTERVAL, TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN, TWITTER_MONITORING_INTERVAL
 
 # Налаштування логування - тільки критичні помилки для швидкості
@@ -35,18 +39,110 @@ user_states = {}  # user_id -> {'state': 'adding_project', 'data': {...}}
 # Глобальна змінна для зберігання активного бота
 bot_instance = None
 
+def require_auth(func):
+    """Декоратор для перевірки авторизації користувача"""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        # Перевіряємо чи користувач авторизований
+        if not access_manager.is_authorized(user_id):
+            await update.message.reply_text(
+                "🔐 **Доступ обмежено!**\n\n"
+                "Для використання цієї команди необхідна авторизація.\n"
+                "Використовуйте команду /login для входу в систему.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Викликаємо оригінальну функцію
+        return await func(update, context)
+    
+    return wrapper
+
+def download_and_send_image(image_url: str, chat_id: str, caption: str = "") -> bool:
+    """Завантажити та відправити зображення в Telegram"""
+    try:
+        # Додаємо параметри для Twitter зображень якщо потрібно
+        if 'pbs.twimg.com/media/' in image_url and '?' not in image_url:
+            image_url += '?format=jpg&name=medium'
+        
+        # Завантажуємо зображення
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://x.com/'
+        }
+        
+        logger.info(f"📥 Завантажуємо зображення: {image_url}")
+        response = requests.get(image_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        logger.info(f"✅ Зображення завантажено успішно, розмір: {len(response.content)} байт")
+        
+        # Перевіряємо розмір файлу (максимум 20MB для Telegram)
+        if len(response.content) > 20 * 1024 * 1024:
+            logger.warning(f"Зображення занадто велике: {len(response.content)} байт")
+            return False
+        
+        # Визначаємо розширення файлу
+        content_type = response.headers.get('content-type', '')
+        if 'jpeg' in content_type or 'jpg' in content_type:
+            suffix = '.jpg'
+        elif 'png' in content_type:
+            suffix = '.png'
+        elif 'webp' in content_type:
+            suffix = '.webp'
+        else:
+            suffix = '.jpg'  # За замовчуванням
+        
+        # Створюємо тимчасовий файл
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(response.content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Відправляємо фото через Telegram API
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+            
+            with open(temp_file_path, 'rb') as photo_file:
+                files = {'photo': photo_file}
+                data = {
+                    'chat_id': chat_id,
+                    'caption': caption[:1024] if caption else '',  # Telegram обмежує caption до 1024 символів
+                    'parse_mode': 'Markdown'
+                }
+                
+                response = requests.post(url, files=files, data=data, timeout=30)
+                
+                if response.status_code == 200:
+                    logger.info(f"✅ Зображення відправлено в канал {chat_id}")
+                    return True
+                else:
+                    logger.error(f"❌ Помилка відправки зображення: {response.status_code}")
+                    logger.error(f"Відповідь сервера: {response.text}")
+                    return False
+                    
+        finally:
+            # Видаляємо тимчасовий файл
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Помилка завантаження/відправки зображення: {e}")
+        return False
+
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     """Створити головне меню"""
     keyboard = [
-        [InlineKeyboardButton("➕ Додати проект", callback_data="add_project")],
         [InlineKeyboardButton("📋 Мої проекти", callback_data="my_projects")],
-        [InlineKeyboardButton("🔧 Менеджер акаунтів", callback_data="account_manager")],
-        [InlineKeyboardButton("📜 Історія Discord", callback_data="discord_history")],
+        [InlineKeyboardButton("➕ Додати проект", callback_data="add_project")],
         [InlineKeyboardButton("🐦 Selenium Twitter", callback_data="selenium_twitter")],
+        [InlineKeyboardButton("📜 Історія Discord", callback_data="discord_history")],
         [InlineKeyboardButton("📢 Пересилання", callback_data="forward_settings")],
-        [InlineKeyboardButton("🔧 Діагностика", callback_data="diagnostics")],
-        [InlineKeyboardButton("⚙️ Налаштування", callback_data="settings")],
-        [InlineKeyboardButton("❓ Допомога", callback_data="help")]
+        [InlineKeyboardButton("⚙️ Налаштування", callback_data="settings")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -57,6 +153,94 @@ def get_platform_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💬 Discord", callback_data="platform_discord")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_projects_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Створити меню управління проектами"""
+    projects = project_manager.get_user_projects(user_id)
+    selenium_accounts = project_manager.get_selenium_accounts()
+    
+    keyboard = []
+    
+    # Twitter проекти
+    twitter_projects = [p for p in projects if p['platform'] == 'twitter']
+    if twitter_projects:
+        keyboard.append([InlineKeyboardButton("🐦 Twitter проекти", callback_data="twitter_projects")])
+    
+    # Discord проекти
+    discord_projects = [p for p in projects if p['platform'] == 'discord']
+    if discord_projects:
+        keyboard.append([InlineKeyboardButton("💬 Discord проекти", callback_data="discord_projects")])
+    
+    # Selenium Twitter акаунти
+    if selenium_accounts:
+        keyboard.append([InlineKeyboardButton("🚀 Selenium Twitter", callback_data="selenium_accounts")])
+    
+    # Кнопки додавання
+    keyboard.append([InlineKeyboardButton("➕ Додати Twitter", callback_data="add_twitter")])
+    keyboard.append([InlineKeyboardButton("➕ Додати Discord", callback_data="add_discord")])
+    keyboard.append([InlineKeyboardButton("🚀 Додати Selenium", callback_data="add_selenium")])
+    
+    # Назад
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_twitter_projects_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Створити клавіатуру Twitter проектів"""
+    projects = project_manager.get_user_projects(user_id)
+    twitter_projects = [p for p in projects if p['platform'] == 'twitter']
+    
+    keyboard = []
+    
+    for project in twitter_projects:
+        # Обмежуємо довжину назви
+        name = project['name'][:20] + "..." if len(project['name']) > 20 else project['name']
+        keyboard.append([
+            InlineKeyboardButton(f"🐦 {name}", callback_data=f"view_twitter_{project['id']}"),
+            InlineKeyboardButton("❌", callback_data=f"delete_twitter_{project['id']}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("➕ Додати Twitter", callback_data="add_twitter")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="projects_menu")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_discord_projects_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Створити клавіатуру Discord проектів"""
+    projects = project_manager.get_user_projects(user_id)
+    discord_projects = [p for p in projects if p['platform'] == 'discord']
+    
+    keyboard = []
+    
+    for project in discord_projects:
+        # Обмежуємо довжину назви
+        name = project['name'][:20] + "..." if len(project['name']) > 20 else project['name']
+        keyboard.append([
+            InlineKeyboardButton(f"💬 {name}", callback_data=f"view_discord_{project['id']}"),
+            InlineKeyboardButton("❌", callback_data=f"delete_discord_{project['id']}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("➕ Додати Discord", callback_data="add_discord")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="projects_menu")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_selenium_accounts_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру Selenium акаунтів"""
+    selenium_accounts = project_manager.get_selenium_accounts()
+    
+    keyboard = []
+    
+    for username in selenium_accounts:
+        keyboard.append([
+            InlineKeyboardButton(f"🚀 @{username}", callback_data=f"view_selenium_{username}"),
+            InlineKeyboardButton("❌", callback_data=f"delete_selenium_{username}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("➕ Додати Selenium", callback_data="add_selenium")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="projects_menu")])
+    
     return InlineKeyboardMarkup(keyboard)
 
 def get_history_count_keyboard() -> InlineKeyboardMarkup:
@@ -155,20 +339,153 @@ def extract_twitter_username(url: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник команди /start"""
     user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
     
-    if security_manager.is_user_authorized(user_id):
-        welcome_text = (
-            f"Привіт {update.effective_user.first_name}! 👋\n\n"
-            f"🔐 Час до закінчення сесії: {security_manager.get_session_time_left(user_id)} секунд\n\n"
-            f"Оберіть дію з меню нижче:"
-        )
+    # Перевіряємо чи користувач вже авторизований через нову систему
+    if access_manager.is_authorized(user_id):
+        # Оновлюємо активність сесії
+        access_manager.update_session_activity(user_id)
+        # Перевіряємо статус Selenium моніторингу
+        selenium_status = "🚀 Активний" if selenium_twitter_monitor and selenium_twitter_monitor.monitoring_active else "⏸️ Неактивний"
+        selenium_accounts = len(selenium_twitter_monitor.monitoring_accounts) if selenium_twitter_monitor else 0
+        
         await update.message.reply_text(
-            welcome_text,
-            reply_markup=get_main_menu_keyboard()
+            f"👋 Привіт, {username}!\n\n"
+            "Ви вже авторизовані в системі.\n\n"
+            f"🚀 **Selenium Twitter моніторинг:** {selenium_status}\n"
+            f"📊 **Акаунтів для моніторингу:** {selenium_accounts}\n\n"
+            "Використовуйте меню нижче для навігації.",
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode='Markdown'
         )
     else:
-        waiting_for_password[user_id] = True
-        await update.message.reply_text(MESSAGES['password_request'])
+        await update.message.reply_text(
+            f"👋 Привіт, {username}!\n\n"
+            "🔐 Для використання бота необхідна авторизація\n\n"
+            "Використовуйте команду /login для входу в систему.\n"
+            "Якщо ви новий користувач, зверніться до адміністратора."
+        )
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для авторизації користувача"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    
+    # Перевіряємо чи користувач вже авторизований
+    if access_manager.is_authorized(user_id):
+        # Оновлюємо активність сесії
+        access_manager.update_session_activity(user_id)
+        await update.message.reply_text(
+            "✅ Ви вже авторизовані в системі!",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Перевіряємо чи користувач існує в системі
+    user_data = access_manager.get_user_by_telegram_id(user_id)
+    if not user_data:
+        await update.message.reply_text(
+            "❌ **Користувач не знайдений!**\n\n"
+            "Ваш Telegram ID не зареєстрований в системі.\n"
+            "Зверніться до адміністратора для реєстрації.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Перевіряємо чи користувач активний
+    if not user_data.get("is_active", True):
+        await update.message.reply_text(
+            "❌ **Доступ заблоковано!**\n\n"
+            "Ваш акаунт деактивований.\n"
+            "Зверніться до адміністратора.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Запитуємо пароль
+    await update.message.reply_text(
+        "🔐 **Введіть пароль для авторизації:**\n\n"
+        "Надішліть пароль повідомленням.",
+        parse_mode='Markdown'
+    )
+    
+    # Встановлюємо стан очікування паролю
+    waiting_for_password[user_id] = True
+
+async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для виходу з системи"""
+    user_id = update.effective_user.id
+    
+    if access_manager.is_authorized(user_id):
+        access_manager.logout_user(user_id)
+        await update.message.reply_text(
+            "👋 **Ви успішно вийшли з системи!**\n\n"
+            "Для повторного входу використовуйте команду /login",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ Ви не авторизовані в системі.",
+            parse_mode='Markdown'
+        )
+
+async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для реєстрації нового користувача (тільки для адміністратора)"""
+    user_id = update.effective_user.id
+    
+    # Перевіряємо чи користувач має права адміністратора
+    if not access_manager.check_permission(user_id, "can_manage_users"):
+        await update.message.reply_text(
+            "❌ **Доступ заборонено!**\n\n"
+            "Тільки адміністратор може реєструвати нових користувачів.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "📝 **Реєстрація нового користувача**\n\n"
+            "Використання: /register <telegram_id> <username> [password]\n\n"
+            "Приклад: /register 123456789 JohnDoe mypassword",
+            parse_mode='Markdown'
+        )
+        return
+    
+    try:
+        target_telegram_id = int(context.args[0])
+        username = context.args[1] if len(context.args) > 1 else ""
+        password = context.args[2] if len(context.args) > 2 else None
+        
+        # Додаємо користувача
+        new_user_id = access_manager.add_user(target_telegram_id, username, password)
+        
+        if new_user_id:
+            await update.message.reply_text(
+                f"✅ **Користувач успішно зареєстрований!**\n\n"
+                f"• Telegram ID: {target_telegram_id}\n"
+                f"• Username: {username}\n"
+                f"• User ID: {new_user_id}\n"
+                f"• Пароль: {password or 'за замовчуванням'}",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Помилка реєстрації користувача.",
+                parse_mode='Markdown'
+            )
+            
+    except ValueError:
+        await update.message.reply_text(
+            "❌ **Неправильний формат!**\n\n"
+            "Telegram ID повинен бути числом.\n"
+            "Приклад: /register 123456789 JohnDoe",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Помилка реєстрації: {str(e)}",
+            parse_mode='Markdown'
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник повідомлень"""
@@ -190,27 +507,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     message_text = update.message.text
     
-    # Якщо користувач очікує введення пароля
+    # Якщо користувач очікує введення пароля для нової системи
     if user_id in waiting_for_password:
-        if message_text == ADMIN_PASSWORD:
-            security_manager.authorize_user(user_id)
+        # Спробуємо авторизувати через нову систему
+        if access_manager.authenticate_user(user_id, message_text):
             del waiting_for_password[user_id]
-            welcome_text = (
-                f"{MESSAGES['password_correct']}\n\n"
-                f"Оберіть дію з меню нижче:"
-            )
+            # Оновлюємо активність сесії
+            access_manager.update_session_activity(user_id)
             await update.message.reply_text(
-                welcome_text,
-                reply_markup=get_main_menu_keyboard()
+                "✅ **Авторизація успішна!**\n\n"
+                "Оберіть дію з меню нижче:",
+                reply_markup=get_main_menu_keyboard(),
+                parse_mode='Markdown'
             )
         else:
-            await update.message.reply_text(MESSAGES['password_incorrect'])
+            await update.message.reply_text(
+                "❌ **Неправильний пароль!**\n\n"
+                "Спробуйте ще раз або зверніться до адміністратора.",
+                parse_mode='Markdown'
+            )
         return
     
-    # Перевіряємо авторизацію для інших повідомлень
-    if not security_manager.is_user_authorized(user_id):
-        waiting_for_password[user_id] = True
-        await update.message.reply_text(MESSAGES['session_expired'])
+    # Перевіряємо авторизацію для інших повідомлень через нову систему
+    if not access_manager.is_authorized(user_id):
+        await update.message.reply_text(
+            "🔐 **Доступ обмежено!**\n\n"
+            "Для використання бота необхідна авторизація.\n"
+            "Використовуйте команду /login для входу в систему.",
+            parse_mode='Markdown'
+        )
         return
     
     # Оновлюємо активність користувача
@@ -222,6 +547,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await handle_project_creation(update, context)
         elif user_states[user_id]['state'] == 'setting_forward_channel':
             await handle_forward_channel_setting(update, context)
+        elif user_states[user_id]['state'] == 'adding_twitter':
+            await handle_twitter_addition(update, context)
+        elif user_states[user_id]['state'] == 'adding_discord':
+            await handle_discord_addition(update, context)
+        elif user_states[user_id]['state'] == 'adding_selenium':
+            await handle_selenium_addition(update, context)
         return
     
     # Обробляємо команди
@@ -268,12 +599,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     
     # Перевіряємо авторизацію
-    if not security_manager.is_user_authorized(user_id):
-        await query.edit_message_text(MESSAGES['session_expired'])
+    if not access_manager.is_authorized(user_id):
+        await query.edit_message_text(
+            "🔐 **Доступ обмежено!**\n\n"
+            "Ваша сесія закінчилася. Для використання бота необхідна повторна авторизація.\n"
+            "Використовуйте команду /login для входу в систему.",
+            parse_mode='Markdown'
+        )
         return
     
     # Оновлюємо активність користувача
-    security_manager.update_user_activity(user_id)
+    access_manager.update_session_activity(user_id)
     
     # Додаємо/оновлюємо користувача в базі даних
     if not project_manager.get_user_data(user_id):
@@ -297,11 +633,53 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=get_platform_keyboard()
         )
     elif callback_data == "my_projects":
-        projects_text = project_manager.format_projects_list(user_id)
-        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
         await query.edit_message_text(
-            projects_text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "📋 Управління проектами\n\nОберіть категорію:",
+            reply_markup=get_projects_menu_keyboard(user_id)
+        )
+    elif callback_data == "projects_menu":
+        await query.edit_message_text(
+            "📋 Управління проектами\n\nОберіть категорію:",
+            reply_markup=get_projects_menu_keyboard(user_id)
+        )
+    elif callback_data == "twitter_projects":
+        await query.edit_message_text(
+            "🐦 Twitter проекти\n\nОберіть проект для управління:",
+            reply_markup=get_twitter_projects_keyboard(user_id)
+        )
+    elif callback_data == "discord_projects":
+        await query.edit_message_text(
+            "💬 Discord проекти\n\nОберіть проект для управління:",
+            reply_markup=get_discord_projects_keyboard(user_id)
+        )
+    elif callback_data == "selenium_accounts":
+        await query.edit_message_text(
+            "🚀 Selenium Twitter акаунти\n\nОберіть акаунт для управління:",
+            reply_markup=get_selenium_accounts_keyboard()
+        )
+    elif callback_data == "add_twitter":
+        user_states[user_id] = {
+            'state': 'adding_twitter',
+            'data': {}
+        }
+        await query.edit_message_text(
+            "🐦 Додавання Twitter акаунта\n\nВведіть username акаунта (без @):"
+        )
+    elif callback_data == "add_discord":
+        user_states[user_id] = {
+            'state': 'adding_discord',
+            'data': {}
+        }
+        await query.edit_message_text(
+            "💬 Додавання Discord каналу\n\nВведіть ID каналу:"
+        )
+    elif callback_data == "add_selenium":
+        user_states[user_id] = {
+            'state': 'adding_selenium',
+            'data': {}
+        }
+        await query.edit_message_text(
+            "🚀 Додавання Selenium Twitter акаунта\n\nВведіть username акаунта (без @):"
         )
     elif callback_data == "platform_twitter":
         user_states[user_id] = {
@@ -340,8 +718,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     elif callback_data == "selenium_twitter":
+        # Перевіряємо статус Selenium моніторингу
+        selenium_status = "🚀 Активний" if selenium_twitter_monitor and selenium_twitter_monitor.monitoring_active else "⏸️ Неактивний"
+        selenium_accounts = len(selenium_twitter_monitor.monitoring_accounts) if selenium_twitter_monitor else 0
+        
         selenium_text = (
             "🐦 **Selenium Twitter Моніторинг**\n\n"
+            f"📊 **Статус:** {selenium_status}\n"
+            f"👥 **Акаунтів:** {selenium_accounts}\n"
+            f"🔄 **Автозапуск:** ✅ Увімкнено\n\n"
             "🔧 **Доступні команди:**\n"
             "• `/selenium_auth` - Авторизація в Twitter\n"
             "• `/selenium_add username` - Додати акаунт\n"
@@ -352,12 +737,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "1. `/selenium_auth` - увійдіть в Twitter\n"
             "2. `/selenium_add pilk_xz` - додайте акаунт\n"
             "3. `/selenium_test pilk_xz` - протестуйте\n"
-            "4. `/selenium_start` - запустіть моніторинг\n\n"
+            "4. Моніторинг запуститься автоматично!\n\n"
             "💡 **Переваги Selenium:**\n"
             "• Реальний браузер\n"
             "• Авторизований доступ\n"
             "• Надійний парсинг\n"
-            "• Обхід обмежень API"
+            "• Обхід обмежень API\n"
+            "• Автоматичний запуск з ботом"
         )
         keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
         await query.edit_message_text(
@@ -365,6 +751,105 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
+    elif callback_data.startswith("delete_twitter_"):
+        project_id = int(callback_data.replace("delete_twitter_", ""))
+        try:
+            project_manager.remove_project(user_id, project_id)
+            await query.edit_message_text(
+                "✅ Twitter проект успішно видалено!",
+                reply_markup=get_twitter_projects_keyboard(user_id)
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Помилка видалення проекту: {e}",
+                reply_markup=get_twitter_projects_keyboard(user_id)
+            )
+    elif callback_data.startswith("delete_discord_"):
+        project_id = int(callback_data.replace("delete_discord_", ""))
+        try:
+            project_manager.remove_project(user_id, project_id)
+            await query.edit_message_text(
+                "✅ Discord проект успішно видалено!",
+                reply_markup=get_discord_projects_keyboard(user_id)
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Помилка видалення проекту: {e}",
+                reply_markup=get_discord_projects_keyboard(user_id)
+            )
+    elif callback_data.startswith("delete_selenium_"):
+        username = callback_data.replace("delete_selenium_", "")
+        try:
+            project_manager.remove_selenium_account(username)
+            if selenium_twitter_monitor:
+                selenium_twitter_monitor.remove_account(username)
+            await query.edit_message_text(
+                f"✅ Selenium акаунт @{username} успішно видалено!",
+                reply_markup=get_selenium_accounts_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Помилка видалення акаунта: {e}",
+                reply_markup=get_selenium_accounts_keyboard()
+            )
+    elif callback_data.startswith("view_twitter_"):
+        project_id = callback_data.replace("view_twitter_", "")
+        project = project_manager.get_project_by_id(user_id, project_id)
+        if project:
+            text = f"🐦 **Twitter проект: {project['name']}**\n\n"
+            text += f"📝 **Опис:** {project.get('description', 'Немає опису')}\n"
+            text += f"🔗 **URL:** {project.get('url', 'Немає URL')}\n"
+            text += f"📅 **Створено:** {project.get('created_at', 'Невідомо')}\n"
+            text += f"🔄 **Статус:** {'Активний' if project.get('is_active', True) else 'Неактивний'}"
+            
+            keyboard = [
+                [InlineKeyboardButton("❌ Видалити", callback_data=f"delete_twitter_{project_id}")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="twitter_projects")]
+            ]
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+    elif callback_data.startswith("view_discord_"):
+        project_id = callback_data.replace("view_discord_", "")
+        project = project_manager.get_project_by_id(user_id, project_id)
+        if project:
+            text = f"💬 **Discord проект: {project['name']}**\n\n"
+            text += f"📝 **Опис:** {project.get('description', 'Немає опису')}\n"
+            text += f"🔗 **URL:** {project.get('url', 'Немає URL')}\n"
+            text += f"📅 **Створено:** {project.get('created_at', 'Невідомо')}\n"
+            text += f"🔄 **Статус:** {'Активний' if project.get('is_active', True) else 'Неактивний'}"
+            
+            keyboard = [
+                [InlineKeyboardButton("❌ Видалити", callback_data=f"delete_discord_{project_id}")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="discord_projects")]
+            ]
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+    elif callback_data.startswith("view_selenium_"):
+        username = callback_data.replace("view_selenium_", "")
+        selenium_accounts = project_manager.get_selenium_accounts()
+        if username in selenium_accounts:
+            account_data = selenium_accounts[username]
+            text = f"🚀 **Selenium Twitter: @{username}**\n\n"
+            text += f"📅 **Додано:** {account_data.get('added_at', 'Невідомо')}\n"
+            text += f"👤 **Додав:** {account_data.get('added_by', 'Невідомо')}\n"
+            text += f"🔄 **Статус:** {'Активний' if account_data.get('is_active', True) else 'Неактивний'}\n"
+            text += f"⏰ **Остання перевірка:** {account_data.get('last_checked', 'Ніколи')}"
+            
+            keyboard = [
+                [InlineKeyboardButton("❌ Видалити", callback_data=f"delete_selenium_{username}")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="selenium_accounts")]
+            ]
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
     elif callback_data == "account_manager":
         # Показуємо менеджер акаунтів
         projects = project_manager.get_user_projects(user_id)
@@ -849,6 +1334,118 @@ async def handle_forward_channel_setting(update: Update, context: ContextTypes.D
     if user_id in user_states:
         del user_states[user_id]
 
+async def handle_twitter_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник додавання Twitter акаунта"""
+    user_id = update.effective_user.id
+    username = update.message.text.strip().replace('@', '')
+    
+    try:
+        # Додаємо до Twitter моніторингу
+        if twitter_monitor:
+            twitter_monitor.add_account(username)
+        
+        # Створюємо проект
+        project_data = {
+            'name': f"Twitter: @{username}",
+            'platform': 'twitter',
+            'url': f"https://twitter.com/{username}",
+            'description': f"Моніторинг Twitter акаунта @{username}"
+        }
+        
+        if project_manager.add_project(user_id, project_data):
+            await update.message.reply_text(
+                f"✅ **Twitter акаунт успішно додано!**\n\n"
+                f"🐦 **Username:** @{username}\n"
+                f"🔗 **URL:** https://twitter.com/{username}\n\n"
+                f"Акаунт додано до моніторингу.",
+                reply_markup=get_twitter_projects_keyboard(user_id),
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Помилка при додаванні проекту.",
+                reply_markup=get_twitter_projects_keyboard(user_id)
+            )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Помилка: {str(e)}",
+            reply_markup=get_twitter_projects_keyboard(user_id)
+        )
+    
+    # Очищаємо стан
+    del user_states[user_id]
+
+async def handle_discord_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник додавання Discord каналу"""
+    user_id = update.effective_user.id
+    channel_id = update.message.text.strip()
+    
+    try:
+        # Додаємо до Discord моніторингу
+        if discord_monitor:
+            discord_monitor.add_channel(channel_id)
+        
+        # Створюємо проект
+        project_data = {
+            'name': f"Discord: {channel_id}",
+            'platform': 'discord',
+            'url': f"https://discord.com/channels/{channel_id}",
+            'description': f"Моніторинг Discord каналу {channel_id}"
+        }
+        
+        if project_manager.add_project(user_id, project_data):
+            await update.message.reply_text(
+                f"✅ **Discord канал успішно додано!**\n\n"
+                f"💬 **Channel ID:** {channel_id}\n"
+                f"🔗 **URL:** https://discord.com/channels/{channel_id}\n\n"
+                f"Канал додано до моніторингу.",
+                reply_markup=get_discord_projects_keyboard(user_id),
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Помилка при додаванні проекту.",
+                reply_markup=get_discord_projects_keyboard(user_id)
+            )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Помилка: {str(e)}",
+            reply_markup=get_discord_projects_keyboard(user_id)
+        )
+    
+    # Очищаємо стан
+    del user_states[user_id]
+
+async def handle_selenium_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник додавання Selenium Twitter акаунта"""
+    user_id = update.effective_user.id
+    username = update.message.text.strip().replace('@', '')
+    
+    try:
+        # Додаємо до Selenium моніторингу
+        if selenium_twitter_monitor:
+            selenium_twitter_monitor.add_account(username)
+        
+        # Додаємо до проектного менеджера
+        project_manager.add_selenium_account(username, user_id)
+        
+        await update.message.reply_text(
+            f"✅ **Selenium Twitter акаунт успішно додано!**\n\n"
+            f"🚀 **Username:** @{username}\n"
+            f"🔗 **URL:** https://x.com/{username}\n\n"
+            f"Акаунт додано до Selenium моніторингу.",
+            reply_markup=get_selenium_accounts_keyboard(),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Помилка: {str(e)}",
+            reply_markup=get_selenium_accounts_keyboard()
+        )
+    
+    # Очищаємо стан
+    del user_states[user_id]
+
 async def handle_channel_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник пінгу бота в каналі"""
     try:
@@ -1111,6 +1708,9 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
             except:
                 pass
             
+            # Отримуємо зображення з повідомлення
+            images = message.get('images', [])
+            
             forward_text = (
                 f"📢 **Нове повідомлення з Discord**\n"
                 f"• Сервер: {server_name}\n"
@@ -1119,6 +1719,10 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                 f"• Текст: {content}\n"
                 f"🔗 [Перейти до повідомлення]({message['url']})"
             )
+            
+            # Додаємо інформацію про зображення якщо є
+            if images:
+                forward_text += f"\n📷 Зображень: {len(images)}"
             
             for user_id in users_with_forwarding:
                 try:
@@ -1132,17 +1736,28 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                     if project_manager.is_message_sent(forward_key, forward_channel, user_id):
                         continue
                     
-                    # Швидка відправка
-                    import requests
+                    # Відправляємо текст повідомлення
                     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
                     data = {
                         'chat_id': forward_channel,
                         'text': forward_text,
                         'parse_mode': 'Markdown'
                     }
-                    response = requests.post(url, data=data, timeout=3)  # Зменшений timeout
+                    response = requests.post(url, data=data, timeout=3)
                     
                     if response.status_code == 200:
+                        # Відправляємо зображення якщо є
+                        if images:
+                            for i, image_url in enumerate(images[:5]):  # Максимум 5 зображень
+                                try:
+                                    image_caption = f"📷 Discord зображення {i+1}/{len(images)}" if len(images) > 1 else "📷 Discord зображення"
+                                    download_and_send_image(image_url, forward_channel, image_caption)
+                                    # Невелика затримка між зображеннями
+                                    import time
+                                    time.sleep(1)
+                                except Exception as e:
+                                    logger.error(f"Помилка відправки Discord зображення: {e}")
+                        
                         project_manager.add_sent_message(forward_key, forward_channel, user_id)
                         logger.info(f"✅ Переслано в канал {forward_channel} (користувач {user_id})")
                     else:
@@ -1201,6 +1816,9 @@ def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
                 except:
                     formatted_date = timestamp[:19] if len(timestamp) > 19 else timestamp
             
+            # Отримуємо зображення з твіта
+            images = tweet.get('images', [])
+            
             forward_text = (
                 f"🐦 **Новий твіт з Twitter**\n"
                 f"• Профіль: @{account}\n"
@@ -1209,6 +1827,10 @@ def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
                 f"• Текст: {text}\n"
                 f"🔗 [Перейти до твіта]({tweet.get('url', '')})"
             )
+            
+            # Додаємо інформацію про зображення якщо є
+            if images:
+                forward_text += f"\n📷 Зображень: {len(images)}"
             
             for user_id in users_with_forwarding:
                 try:
@@ -1222,8 +1844,7 @@ def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
                     if project_manager.is_message_sent(forward_key, forward_channel, user_id):
                         continue
                     
-                    # Швидка відправка
-                    import requests
+                    # Відправляємо текст повідомлення
                     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
                     data = {
                         'chat_id': forward_channel,
@@ -1233,6 +1854,26 @@ def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
                     response = requests.post(url, data=data, timeout=3)
                     
                     if response.status_code == 200:
+                        # Відправляємо зображення якщо є
+                        if images:
+                            logger.info(f"📷 Знайдено {len(images)} зображень для відправки в канал {forward_channel}")
+                            for i, image_url in enumerate(images[:5]):  # Максимум 5 зображень
+                                try:
+                                    logger.info(f"📤 Відправляємо зображення {i+1}/{len(images)}: {image_url}")
+                                    image_caption = f"📷 Twitter зображення {i+1}/{len(images)}" if len(images) > 1 else "📷 Twitter зображення"
+                                    success = download_and_send_image(image_url, forward_channel, image_caption)
+                                    if success:
+                                        logger.info(f"✅ Зображення {i+1} успішно відправлено")
+                                    else:
+                                        logger.warning(f"⚠️ Не вдалося відправити зображення {i+1}")
+                                    # Невелика затримка між зображеннями
+                                    import time
+                                    time.sleep(1)
+                                except Exception as e:
+                                    logger.error(f"❌ Помилка відправки Twitter зображення {i+1}: {e}")
+                        else:
+                            logger.info(f"ℹ️ Зображень не знайдено для твіта {tweet_id}")
+                        
                         project_manager.add_sent_message(forward_key, forward_channel, user_id)
                         logger.info(f"✅ Переслано Twitter твіт в канал {forward_channel} (користувач {user_id})")
                     else:
@@ -1326,11 +1967,21 @@ async def start_selenium_twitter_monitoring():
     if not selenium_twitter_monitor:
         logger.warning("Selenium Twitter монітор не ініціалізовано")
         return
+    
+    # Перевіряємо чи драйвер ініціалізовано
+    if not selenium_twitter_monitor.driver:
+        logger.warning("Selenium драйвер не ініціалізовано, спробуємо ініціалізувати...")
+        if not selenium_twitter_monitor._setup_driver(headless=True):
+            logger.error("Не вдалося ініціалізувати Selenium драйвер, пропускаємо моніторинг")
+            return
         
     try:
         selenium_twitter_monitor.monitoring_active = True
         
-        logger.info(f"Запуск Selenium моніторингу Twitter акаунтів: {list(selenium_twitter_monitor.monitoring_accounts)}")
+        if selenium_twitter_monitor.monitoring_accounts:
+            logger.info(f"🚀 Запуск Selenium моніторингу Twitter акаунтів: {list(selenium_twitter_monitor.monitoring_accounts)}")
+        else:
+            logger.info("🚀 Selenium Twitter моніторинг запущено (очікує додавання акаунтів)")
         
         # Основний цикл моніторингу
         while selenium_twitter_monitor.monitoring_active:
@@ -1348,7 +1999,8 @@ async def start_selenium_twitter_monitoring():
                             'author': tweet.get('user', {}).get('name', ''),
                             'text': tweet.get('text', ''),
                             'url': tweet.get('url', ''),
-                            'timestamp': tweet.get('created_at', '')
+                            'timestamp': tweet.get('created_at', ''),
+                            'images': tweet.get('images', [])  # Додаємо зображення!
                         })
                     
                     # Відправляємо сповіщення
@@ -1360,10 +2012,26 @@ async def start_selenium_twitter_monitoring():
                 
             except Exception as e:
                 logger.error(f"Помилка в циклі Selenium моніторингу Twitter: {e}")
+                # Спробуємо переініціалізувати драйвер
+                try:
+                    selenium_twitter_monitor.close_driver()
+                    await asyncio.sleep(5)
+                    if selenium_twitter_monitor._setup_driver(headless=True):
+                        logger.info("Selenium драйвер переініціалізовано")
+                    else:
+                        logger.error("Не вдалося переініціалізувати Selenium драйвер")
+                except Exception as e2:
+                    logger.error(f"Помилка переініціалізації драйвера: {e2}")
+                
                 await asyncio.sleep(30)  # Коротша затримка при помилці
             
     except Exception as e:
         logger.error(f"Помилка Selenium моніторингу Twitter: {e}")
+        # Закриваємо драйвер при критичній помилці
+        try:
+            selenium_twitter_monitor.close_driver()
+        except:
+            pass
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник помилок"""
@@ -1382,6 +2050,13 @@ def cleanup_old_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
         project_manager.cleanup_old_messages(hours=24)
     except Exception as e:
         logger.error(f"Помилка очищення старих повідомлень: {e}")
+
+def cleanup_access_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Очистити закінчені сесії доступу"""
+    try:
+        access_manager.cleanup_expired_sessions()
+    except Exception as e:
+        logger.error(f"Помилка очищення сесій доступу: {e}")
 
 def _get_time_ago(dt: datetime) -> str:
     """Отримати час тому"""
@@ -1415,6 +2090,7 @@ def _get_time_ago(dt: datetime) -> str:
         return ""
 
 # Selenium Twitter команди
+@require_auth
 async def selenium_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для ручної авторизації в Twitter через Selenium"""
     global selenium_twitter_monitor
@@ -1434,9 +2110,11 @@ async def selenium_auth_command(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка авторизації: {str(e)}")
 
+@require_auth
 async def selenium_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Додати акаунт для Selenium моніторингу"""
     global selenium_twitter_monitor
+    user_id = update.effective_user.id
     
     if not context.args:
         await update.message.reply_text("❌ Вкажіть username Twitter акаунта!\n\n**Приклад:** /selenium_add pilk_xz")
@@ -1444,15 +2122,27 @@ async def selenium_add_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     username = context.args[0].replace('@', '').strip()
     
-    if not selenium_twitter_monitor:
-        selenium_twitter_monitor = SeleniumTwitterMonitor()
-        await selenium_twitter_monitor.__aenter__()
-    
-    if selenium_twitter_monitor.add_account(username):
-        await update.message.reply_text(f"✅ Додано Twitter акаунт для Selenium моніторингу: @{username}")
+    # Додаємо акаунт в базу даних
+    if project_manager.add_selenium_account(username, user_id):
+        # Додаємо акаунт в поточний монітор
+        if not selenium_twitter_monitor:
+            selenium_twitter_monitor = SeleniumTwitterMonitor()
+            await selenium_twitter_monitor.__aenter__()
+        
+        if selenium_twitter_monitor.add_account(username):
+            await update.message.reply_text(
+                f"✅ **Додано Twitter акаунт для Selenium моніторингу:**\n\n"
+                f"• Username: @{username}\n"
+                f"• Статус: Активний\n"
+                f"• Збережено в базі даних",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(f"⚠️ Акаунт збережено в базі, але помилка додавання в монітор: @{username}")
     else:
-        await update.message.reply_text(f"❌ Помилка додавання акаунта: @{username}")
+        await update.message.reply_text(f"❌ Помилка збереження акаунта: @{username}")
 
+@require_auth
 async def selenium_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Тестувати Selenium моніторинг"""
     global selenium_twitter_monitor
@@ -1487,6 +2177,7 @@ async def selenium_test_command(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка тестування: {str(e)}")
 
+@require_auth
 async def selenium_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запустити Selenium Twitter моніторинг"""
     global selenium_twitter_monitor
@@ -1507,6 +2198,7 @@ async def selenium_start_command(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text("🚀 **Selenium Twitter моніторинг запущено!**\n\nБот буде перевіряти нові твіти кожні 30 секунд.", parse_mode='Markdown')
 
+@require_auth
 async def selenium_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Зупинити Selenium Twitter моніторинг"""
     global selenium_twitter_monitor
@@ -1519,6 +2211,7 @@ async def selenium_stop_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("⏹️ **Selenium Twitter моніторинг зупинено!**", parse_mode='Markdown')
 
 # Менеджер акаунтів
+@require_auth
 async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показати всі акаунти для моніторингу"""
     user_id = update.effective_user.id
@@ -1526,9 +2219,8 @@ async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Отримуємо проекти користувача
     projects = project_manager.get_user_projects(user_id)
     
-    if not projects:
-        await update.message.reply_text("❌ У вас немає проектів для моніторингу.\n\nДодайте проекти через меню бота.")
-        return
+    # Отримуємо Selenium Twitter акаунти
+    selenium_accounts = project_manager.get_selenium_accounts()
     
     # Групуємо по платформах
     twitter_projects = [p for p in projects if p['platform'] == 'twitter']
@@ -1537,13 +2229,24 @@ async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Форматуємо список
     text = "📋 **Ваші акаунти для моніторингу:**\n\n"
     
+    # Selenium Twitter акаунти
+    if selenium_accounts:
+        text += "🚀 **Selenium Twitter акаунти:**\n"
+        for i, username in enumerate(selenium_accounts, 1):
+            account_info = project_manager.get_selenium_account_info(username)
+            status = "✅ Активний" if account_info and account_info.get('is_active', True) else "❌ Неактивний"
+            text += f"{i}. @{username} - {status}\n"
+        text += "\n"
+    
+    # Звичайні Twitter проекти
     if twitter_projects:
-        text += "🐦 **Twitter/X акаунти:**\n"
+        text += "🐦 **Звичайні Twitter/X акаунти:**\n"
         for i, project in enumerate(twitter_projects, 1):
             username = extract_twitter_username(project['url'])
             text += f"{i}. @{username} ({project['name']})\n"
         text += "\n"
     
+    # Discord канали
     if discord_projects:
         text += "💬 **Discord канали:**\n"
         for i, project in enumerate(discord_projects, 1):
@@ -1551,14 +2254,24 @@ async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             text += f"{i}. Канал {channel_id} ({project['name']})\n"
         text += "\n"
     
-    # Додаємо команди для видалення
-    text += "🔧 **Команди для управління:**\n"
-    text += "• /remove_twitter username - видалити Twitter акаунт\n"
+    # Якщо немає акаунтів
+    if not selenium_accounts and not twitter_projects and not discord_projects:
+        text += "❌ У вас немає акаунтів для моніторингу.\n\n"
+        text += "Додайте акаунти через меню бота або команди:\n"
+        text += "• /selenium_add username - додати Selenium Twitter акаунт\n"
+        text += "• Меню 'Додати проект' - додати звичайний проект"
+    
+    # Додаємо команди для управління
+    text += "\n🔧 **Команди для управління:**\n"
+    text += "• /selenium_add username - додати Selenium Twitter акаунт\n"
+    text += "• /selenium_remove username - видалити Selenium Twitter акаунт\n"
+    text += "• /remove_twitter username - видалити звичайний Twitter акаунт\n"
     text += "• /remove_discord channel_id - видалити Discord канал\n"
     text += "• /accounts - показати цей список"
     
     await update.message.reply_text(text, parse_mode='Markdown')
 
+@require_auth
 async def remove_twitter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видалити Twitter акаунт з моніторингу"""
     user_id = update.effective_user.id
@@ -1584,7 +2297,7 @@ async def remove_twitter_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     # Видаляємо проект
-    if project_manager.remove_project(user_id, project_to_remove['name']):
+    if project_manager.remove_project(user_id, project_to_remove['id']):
         await update.message.reply_text(f"✅ Twitter акаунт @{username} видалено з моніторингу.")
         
         # Також видаляємо з Selenium монітора якщо він активний
@@ -1597,6 +2310,36 @@ async def remove_twitter_command(update: Update, context: ContextTypes.DEFAULT_T
     else:
         await update.message.reply_text(f"❌ Помилка видалення Twitter акаунта @{username}.")
 
+@require_auth
+async def selenium_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Видалити Selenium Twitter акаунт з моніторингу"""
+    global selenium_twitter_monitor
+    
+    if not context.args:
+        await update.message.reply_text("❌ Вкажіть username Twitter акаунта!\n\n**Приклад:** /selenium_remove pilk_xz")
+        return
+    
+    username = context.args[0].replace('@', '').strip()
+    
+    # Видаляємо з бази даних
+    if project_manager.remove_selenium_account(username):
+        # Видаляємо з поточного монітора
+        if selenium_twitter_monitor and username in selenium_twitter_monitor.monitoring_accounts:
+            selenium_twitter_monitor.monitoring_accounts.remove(username)
+            if username in selenium_twitter_monitor.seen_tweets:
+                del selenium_twitter_monitor.seen_tweets[username]
+        
+        await update.message.reply_text(
+            f"✅ **Видалено Selenium Twitter акаунт:**\n\n"
+            f"• Username: @{username}\n"
+            f"• Видалено з бази даних\n"
+            f"• Видалено з поточного монітора",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(f"❌ Акаунт @{username} не знайдено в Selenium моніторингу")
+
+@require_auth
 async def remove_discord_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видалити Discord канал з моніторингу"""
     user_id = update.effective_user.id
@@ -1622,7 +2365,7 @@ async def remove_discord_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     # Видаляємо проект
-    if project_manager.remove_project(user_id, project_to_remove['name']):
+    if project_manager.remove_project(user_id, project_to_remove['id']):
         await update.message.reply_text(f"✅ Discord канал {channel_id} видалено з моніторингу.")
         
         # Також видаляємо з Discord монітора якщо він активний
@@ -1664,6 +2407,12 @@ def main() -> None:
     
     # Додаємо обробники
     application.add_handler(CommandHandler("start", start))
+    
+    # Команди авторизації
+    application.add_handler(CommandHandler("login", login_command))
+    application.add_handler(CommandHandler("logout", logout_command))
+    application.add_handler(CommandHandler("register", register_command))
+    
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
@@ -1673,6 +2422,7 @@ def main() -> None:
     application.add_handler(CommandHandler("selenium_test", selenium_test_command))
     application.add_handler(CommandHandler("selenium_start", selenium_start_command))
     application.add_handler(CommandHandler("selenium_stop", selenium_stop_command))
+    application.add_handler(CommandHandler("selenium_remove", selenium_remove_command))
     
     # Менеджер акаунтів
     application.add_handler(CommandHandler("accounts", accounts_command))
@@ -1687,6 +2437,9 @@ def main() -> None:
     
     # Додаємо періодичне очищення старих повідомлень (кожні 2 години)
     job_queue.run_repeating(cleanup_old_messages, interval=7200, first=7200)
+    
+    # Додаємо періодичне очищення сесій доступу (кожні 30 хвилин)
+    job_queue.run_repeating(cleanup_access_sessions, interval=1800, first=1800)  # Кожні 30 хвилин
     
     logger.info("Бот запускається...")
     
@@ -1705,6 +2458,26 @@ def main() -> None:
         twitter_thread.daemon = True
         twitter_thread.start()
         logger.info("Twitter моніторинг запущено")
+    
+    # Автоматично запускаємо Selenium Twitter моніторинг
+    global selenium_twitter_monitor
+    selenium_twitter_monitor = SeleniumTwitterMonitor()
+    
+    # Завантажуємо збережені акаунти
+    saved_accounts = project_manager.get_selenium_accounts()
+    if saved_accounts:
+        logger.info(f"Завантажено {len(saved_accounts)} збережених Selenium акаунтів: {saved_accounts}")
+        for username in saved_accounts:
+            selenium_twitter_monitor.add_account(username)
+        logger.info(f"✅ Selenium Twitter моніторинг готовий з {len(saved_accounts)} акаунтами")
+    else:
+        logger.info("ℹ️ Збережених Selenium акаунтів не знайдено - моніторинг буде запущено без акаунтів")
+    
+    # Запускаємо Selenium моніторинг в окремому потоці
+    selenium_thread = threading.Thread(target=lambda: asyncio.run(start_selenium_twitter_monitoring()))
+    selenium_thread.daemon = True
+    selenium_thread.start()
+    logger.info("🚀 Selenium Twitter моніторинг автоматично запущено")
     
     # Запускаємо бота
     try:

@@ -4,3 +4,4 @@ aiohttp==3.9.1
 requests==2.31.0
 selenium==4.15.0
 asyncio
+Pillow>=9.0.0

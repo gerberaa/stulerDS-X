@@ -11,6 +11,7 @@ class ProjectManager:
             'projects': {},  # user_id -> projects
             'users': {},    # user_id -> user_data
             'settings': {}, # global settings
+            'selenium_accounts': {},  # selenium twitter accounts
             'metadata': {
                 'version': '1.0',
                 'created_at': datetime.now().isoformat(),
@@ -99,6 +100,10 @@ class ProjectManager:
         except Exception as e:
             self.logger.error(f"Помилка видалення проекту: {e}")
             return False
+    
+    def remove_project(self, user_id: int, project_id: int) -> bool:
+        """Видалити проект (аліас для delete_project)"""
+        return self.delete_project(user_id, project_id)
             
     def get_project_by_id(self, user_id: int, project_id: int) -> Optional[Dict]:
         """Отримати проект за ID"""
@@ -387,3 +392,96 @@ class ProjectManager:
         except Exception as e:
             self.logger.error(f"Помилка імпорту: {e}")
             return False
+    
+    # Selenium Twitter Accounts Management
+    def add_selenium_account(self, username: str, added_by: int = None) -> bool:
+        """Додати Twitter акаунт для Selenium моніторингу"""
+        try:
+            if 'selenium_accounts' not in self.data:
+                self.data['selenium_accounts'] = {}
+            
+            account_data = {
+                'username': username,
+                'added_at': datetime.now().isoformat(),
+                'added_by': added_by,
+                'is_active': True,
+                'last_checked': None
+            }
+            
+            self.data['selenium_accounts'][username] = account_data
+            self.save_data(force=True)
+            
+            self.logger.info(f"Додано Selenium Twitter акаунт: {username}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Помилка додавання Selenium акаунта {username}: {e}")
+            return False
+    
+    def remove_selenium_account(self, username: str) -> bool:
+        """Видалити Twitter акаунт з Selenium моніторингу"""
+        try:
+            if 'selenium_accounts' not in self.data:
+                return False
+            
+            if username in self.data['selenium_accounts']:
+                del self.data['selenium_accounts'][username]
+                self.save_data(force=True)
+                
+                self.logger.info(f"Видалено Selenium Twitter акаунт: {username}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Помилка видалення Selenium акаунта {username}: {e}")
+            return False
+    
+    def get_selenium_accounts(self) -> List[str]:
+        """Отримати список всіх активних Selenium Twitter акаунтів"""
+        try:
+            if 'selenium_accounts' not in self.data:
+                return []
+            
+            active_accounts = []
+            for username, account_data in self.data['selenium_accounts'].items():
+                if account_data.get('is_active', True):
+                    active_accounts.append(username)
+            
+            return active_accounts
+            
+        except Exception as e:
+            self.logger.error(f"Помилка отримання Selenium акаунтів: {e}")
+            return []
+    
+    def update_selenium_account_status(self, username: str, is_active: bool = True) -> bool:
+        """Оновити статус Selenium Twitter акаунта"""
+        try:
+            if 'selenium_accounts' not in self.data:
+                return False
+            
+            if username in self.data['selenium_accounts']:
+                self.data['selenium_accounts'][username]['is_active'] = is_active
+                self.data['selenium_accounts'][username]['last_checked'] = datetime.now().isoformat()
+                self.save_data(force=True)
+                
+                self.logger.info(f"Оновлено статус Selenium акаунта {username}: {'активний' if is_active else 'неактивний'}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Помилка оновлення статусу Selenium акаунта {username}: {e}")
+            return False
+    
+    def get_selenium_account_info(self, username: str) -> Optional[Dict]:
+        """Отримати інформацію про Selenium Twitter акаунт"""
+        try:
+            if 'selenium_accounts' not in self.data:
+                return None
+            
+            return self.data['selenium_accounts'].get(username)
+            
+        except Exception as e:
+            self.logger.error(f"Помилка отримання інформації про Selenium акаунт {username}: {e}")
+            return None

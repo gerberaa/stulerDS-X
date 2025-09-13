@@ -121,13 +121,18 @@ class DiscordMonitor:
                         
                     # Це нове повідомлення
                     found_new = True
+                    
+                    # Витягуємо фото з повідомлення
+                    images = self._extract_message_images(message)
+                    
                     new_messages.append({
                         'channel_id': channel_id,
                         'message_id': message_id,
                         'content': message.get('content', ''),
                         'author': message.get('author', {}).get('username', 'Unknown'),
                         'timestamp': message.get('timestamp', ''),
-                        'url': f"https://discord.com/channels/{message.get('guild_id', '')}/{channel_id}/{message_id}"
+                        'url': f"https://discord.com/channels/{message.get('guild_id', '')}/{channel_id}/{message_id}",
+                        'images': images
                     })
                 
                 # Діагностичне логування
@@ -142,6 +147,45 @@ class DiscordMonitor:
                 self.logger.error(f"Помилка перевірки каналу {channel_id}: {e}")
                 
         return new_messages
+    
+    def _extract_message_images(self, message: Dict) -> List[str]:
+        """Витягти URL фото з Discord повідомлення"""
+        images = []
+        try:
+            # Перевіряємо attachments (вкладення)
+            attachments = message.get('attachments', [])
+            for attachment in attachments:
+                if attachment.get('content_type', '').startswith('image/'):
+                    url = attachment.get('url')
+                    if url:
+                        images.append(url)
+                        self.logger.debug(f"Знайдено зображення в Discord: {url}")
+            
+            # Перевіряємо embeds (вбудовані повідомлення)
+            embeds = message.get('embeds', [])
+            for embed in embeds:
+                # Зображення в embed
+                if 'image' in embed:
+                    image_url = embed['image'].get('url')
+                    if image_url:
+                        images.append(image_url)
+                        self.logger.debug(f"Знайдено зображення в embed: {image_url}")
+                
+                # Thumbnail в embed
+                if 'thumbnail' in embed:
+                    thumb_url = embed['thumbnail'].get('url')
+                    if thumb_url:
+                        images.append(thumb_url)
+                        self.logger.debug(f"Знайдено thumbnail в embed: {thumb_url}")
+            
+            # Якщо знайшли зображення, логуємо
+            if images:
+                self.logger.info(f"Знайдено {len(images)} зображень в Discord повідомленні")
+                
+        except Exception as e:
+            self.logger.debug(f"Помилка витягування зображень з Discord: {e}")
+            
+        return images
         
     async def start_monitoring(self, callback_func, interval: int = 15):
         """Запустити моніторинг з callback функцією (безпечно)"""
