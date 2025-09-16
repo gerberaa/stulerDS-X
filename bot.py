@@ -39,6 +39,10 @@ user_states = {}  # user_id -> {'state': 'adding_project', 'data': {...}}
 # Глобальна змінна для зберігання активного бота
 bot_instance = None
 
+# Глобальна система відстеження відправлених твітів
+global_sent_tweets = {}  # account -> set of sent tweet_ids
+
+# Декоратор авторизації має бути оголошений до використання
 def require_auth(func):
     """Декоратор для перевірки авторизації користувача"""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -58,6 +62,264 @@ def require_auth(func):
         return await func(update, context)
     
     return wrapper
+
+# ===================== Синхронізація моніторів з проектами =====================
+def sync_monitors_with_projects() -> None:
+    """Звести активні монітори до фактичних проектів і збережених Selenium акаунтів"""
+    try:
+        # Збираємо цільові Twitter usernames із проектів
+        project_usernames = set()
+        for _, projects in project_manager.data.get('projects', {}).items():
+            for p in projects:
+                if p.get('platform') == 'twitter':
+                    username = extract_twitter_username(p.get('url', ''))
+                    if username:
+                        project_usernames.add(username)
+
+        # Додаємо явно збережені selenium акаунти (якщо ще є)
+        selenium_saved = set(project_manager.get_selenium_accounts() or [])
+        target_usernames = project_usernames.union(selenium_saved)
+
+        # Синхронізація Twitter API монітора
+        global twitter_monitor
+        if twitter_monitor is not None:
+            current = set(getattr(twitter_monitor, 'monitoring_accounts', set()))
+            # Видаляємо зайві
+            for username in list(current - target_usernames):
+                try:
+                    twitter_monitor.remove_account(username)
+                except Exception:
+                    pass
+            # Додаємо відсутні (із проектів/selenium_saved)
+            for username in list(target_usernames - current):
+                try:
+                    twitter_monitor.add_account(username)
+                except Exception:
+                    pass
+
+        # Синхронізація Selenium монітора
+        global selenium_twitter_monitor
+        if selenium_twitter_monitor is not None:
+            current = set(getattr(selenium_twitter_monitor, 'monitoring_accounts', set()))
+            # Видаляємо зайві
+            for username in list(current - target_usernames):
+                selenium_twitter_monitor.monitoring_accounts.discard(username)
+                if username in selenium_twitter_monitor.seen_tweets:
+                    del selenium_twitter_monitor.seen_tweets[username]
+            # Додаємо відсутні
+            for username in list(target_usernames - current):
+                selenium_twitter_monitor.add_account(username)
+
+        # Синхронізація Discord каналів
+        global discord_monitor
+        if discord_monitor is not None:
+            project_channels = set()
+            for _, projects in project_manager.data.get('projects', {}).items():
+                for p in projects:
+                    if p.get('platform') == 'discord':
+                        ch = extract_discord_channel_id(p.get('url', ''))
+                        if ch:
+                            project_channels.add(ch)
+            current = set(getattr(discord_monitor, 'monitoring_channels', set()))
+            for ch in list(current - project_channels):
+                discord_monitor.monitoring_channels.discard(ch)
+                if ch in discord_monitor.last_message_ids:
+                    del discord_monitor.last_message_ids[ch]
+            for ch in list(project_channels - current):
+                try:
+                    # Reconstruct URL for add_channel convenience
+                    discord_monitor.add_channel(f"https://discord.com/channels/0/{ch}")
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"Помилка синхронізації моніторів: {e}")
+
+# ===================== Утиліти для Telegram chat_id =====================
+def normalize_chat_id(chat_id_value: str) -> str:
+    """Нормалізувати chat_id: додає -100 для каналів/супергруп, якщо відсутній.
+    Приймає рядок з цифрами або вже валідний від'ємний chat_id."""
+    try:
+        val = str(chat_id_value).strip()
+        if val.startswith('@'):
+            return val  # username, нехай Telegram обробить
+        # Якщо вже від'ємний - залишаємо
+        if val.startswith('-'):
+            return val
+        # Якщо це лише цифри (ймовірно, канал/супергрупа, що потребує -100)
+        if val.isdigit():
+            return '-100' + val
+        return val
+    except Exception:
+        return str(chat_id_value)
+
+# ===================== Визначення отримувачів за проектами =====================
+def get_users_tracking_discord_channel(channel_id: str) -> List[int]:
+    """Повертає список telegram_id користувачів, що мають проект з цим Discord channel_id."""
+    try:
+        tracked_users: List[int] = []
+        target = (channel_id or '').strip()
+        for user_id_str, projects in project_manager.data.get('projects', {}).items():
+            for p in projects:
+                if p.get('platform') == 'discord':
+                    cid = extract_discord_channel_id(p.get('url', ''))
+                    if cid == target:
+                        try:
+                            tracked_users.append(int(user_id_str))
+                        except:
+                            pass
+        return tracked_users
+    except Exception:
+        return []
+
+# ===================== Визначення отримувачів за проектами =====================
+def get_users_tracking_twitter(username: str) -> List[int]:
+    """Повертає список telegram_id користувачів, що мають проект з цим Twitter username."""
+    try:
+        tracked_users: List[int] = []
+        target = (username or '').replace('@', '').strip().lower()
+        for user_id_str, projects in project_manager.data.get('projects', {}).items():
+            for p in projects:
+                if p.get('platform') == 'twitter':
+                    u = extract_twitter_username(p.get('url', '') or '')
+                    if u and u.replace('@', '').strip().lower() == target:
+                        tracked_users.append(int(user_id_str))
+                        break
+        return tracked_users
+    except Exception:
+        return []
+
+def get_users_tracking_discord_channel(channel_id: str) -> List[int]:
+    """Повертає список telegram_id користувачів, що мають проект з цим Discord channel_id."""
+    try:
+        tracked_users: List[int] = []
+        target = str(channel_id)
+        for user_id_str, projects in project_manager.data.get('projects', {}).items():
+            for p in projects:
+                if p.get('platform') == 'discord':
+                    ch = extract_discord_channel_id(p.get('url', '') or '')
+                    if ch and ch == target:
+                        tracked_users.append(int(user_id_str))
+                        break
+        return tracked_users
+    except Exception:
+        return []
+
+@require_auth
+async def handle_forwarded_channel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE, fwd_chat) -> None:
+    """Автоматичне налаштування каналу за пересланим повідомленням з каналу/групи."""
+    user_id = update.effective_user.id
+    try:
+        chat_type = getattr(fwd_chat, 'type', '')
+        chat_id = getattr(fwd_chat, 'id', None)
+        title = getattr(fwd_chat, 'title', '') or getattr(fwd_chat, 'username', '') or 'Unknown'
+        if not chat_id:
+            await update.message.reply_text("❌ Не вдалося визначити ID каналу із пересланого повідомлення.")
+            return
+        # Зберігаємо чат для користувача
+        channel_id_str = str(chat_id)
+        project_manager.set_forward_channel(user_id, channel_id_str)
+        # Тестове повідомлення у канал
+        try:
+            await context.bot.send_message(
+                chat_id=normalize_chat_id(channel_id_str),
+                text=f"✅ Канал підключено! Користувач @{update.effective_user.username or user_id} отримуватиме сповіщення сюди.")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Не вдалося надіслати повідомлення у канал: {e}")
+        await update.message.reply_text(
+            f"✅ Автоналаштування завершено!\n\nКанал: {title}\nID: `{normalize_chat_id(channel_id_str)}`",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Помилка автоналаштування: {e}")
+
+# ===================== Персональні налаштування пересилання =====================
+@require_auth
+async def forward_enable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if project_manager.enable_forward(user_id):
+        status = project_manager.get_forward_status(user_id)
+        channel_id = status.get('channel_id') or '—'
+        await update.message.reply_text(
+            f"🟢 Пересилання увімкнено. Поточний канал: `{channel_id}`",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("❌ Не вдалося увімкнути пересилання.")
+
+@require_auth
+async def forward_disable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if project_manager.disable_forward(user_id):
+        await update.message.reply_text("🔴 Пересилання вимкнено.")
+    else:
+        await update.message.reply_text("❌ Не вдалося вимкнути пересилання.")
+
+@require_auth
+async def forward_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    status = project_manager.get_forward_status(user_id)
+    enabled = status.get('enabled', False)
+    channel_id = status.get('channel_id') or '—'
+    await update.message.reply_text(
+        f"📊 Статус пересилання\n\n"
+        f"• Статус: {'🟢 Увімкнено' if enabled else '🔴 Вимкнено'}\n"
+        f"• Канал: `{channel_id}`\n\n"
+        f"Як налаштувати канал: додайте бота як адміністратора в канал/групу та напишіть там: @" + context.bot.username + " ping",
+        parse_mode='Markdown'
+    )
+
+@require_auth
+async def forward_set_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "Вкажіть ID каналу. Приклад: /forward_set_channel -1001234567890\n\nПідказка: простіше — зайдіть у потрібний канал та напишіть там повідомлення: @"
+            + context.bot.username + " ping (бот збере ID автоматично)")
+        return
+    channel_id = context.args[0]
+    if project_manager.set_forward_channel(user_id, str(channel_id)):
+        await update.message.reply_text(
+            f"✅ Канал пересилання збережено: `{channel_id}`",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("❌ Не вдалося зберегти канал.")
+
+@require_auth
+async def forward_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    channel_id = project_manager.get_forward_channel(user_id)
+    if not channel_id:
+        await update.message.reply_text("❌ Канал не налаштовано. Спробуйте /forward_set_channel або напишіть у каналі: @" + context.bot.username + " ping")
+        return
+    try:
+        text = (
+            "✅ Тестове повідомлення пересилання\n\n"
+            "Це перевірка ваших персональних налаштувань."
+        )
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        data = {'chat_id': normalize_chat_id(channel_id), 'text': text}
+        r = requests.post(url, data=data, timeout=5)
+        if r.status_code == 200:
+            await update.message.reply_text("✅ Тест відправлено у ваш канал пересилання.")
+        else:
+            await update.message.reply_text(f"❌ Помилка відправки у канал: {r.status_code}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Виняток: {e}")
+
+def cleanup_old_tweets():
+    """Очистити старі твіти з глобального відстеження (залишити тільки останні 100)"""
+    global global_sent_tweets
+    
+    for account in global_sent_tweets:
+        if len(global_sent_tweets[account]) > 100:
+            # Конвертуємо в список, сортуємо та залишаємо останні 100
+            tweets_list = list(global_sent_tweets[account])
+            tweets_list.sort(reverse=True)  # Сортуємо за ID (найновіші першими)
+            global_sent_tweets[account] = set(tweets_list[:100])
+            logger.info(f"Очищено старі твіти для {account}, залишено {len(global_sent_tweets[account])} твітів")
+
+ 
 
 def download_and_send_image(image_url: str, chat_id: str, caption: str = "") -> bool:
     """Завантажити та відправити зображення в Telegram"""
@@ -108,7 +370,7 @@ def download_and_send_image(image_url: str, chat_id: str, caption: str = "") -> 
             with open(temp_file_path, 'rb') as photo_file:
                 files = {'photo': photo_file}
                 data = {
-                    'chat_id': chat_id,
+                    'chat_id': normalize_chat_id(chat_id),
                     'caption': caption[:1024] if caption else '',  # Telegram обмежує caption до 1024 символів
                     'parse_mode': 'Markdown'
                 }
@@ -134,8 +396,8 @@ def download_and_send_image(image_url: str, chat_id: str, caption: str = "") -> 
         logger.error(f"Помилка завантаження/відправки зображення: {e}")
         return False
 
-def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Створити головне меню"""
+def get_main_menu_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
+    """Створити головне меню з урахуванням ролі користувача"""
     keyboard = [
         [InlineKeyboardButton("📋 Мої проекти", callback_data="my_projects")],
         [InlineKeyboardButton("➕ Додати проект", callback_data="add_project")],
@@ -144,6 +406,11 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📢 Пересилання", callback_data="forward_settings")],
         [InlineKeyboardButton("⚙️ Налаштування", callback_data="settings")]
     ]
+    
+    # Додаємо адміністративні кнопки для адміністраторів
+    if user_id and access_manager.is_admin(user_id):
+        keyboard.append([InlineKeyboardButton("👑 Адмін панель", callback_data="admin_panel")])
+    
     return InlineKeyboardMarkup(keyboard)
 
 def get_platform_keyboard() -> InlineKeyboardMarkup:
@@ -300,6 +567,64 @@ def get_diagnostics_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def get_admin_panel_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру адміністративної панелі"""
+    keyboard = [
+        [InlineKeyboardButton("👥 Користувачі", callback_data="admin_users")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔧 Система", callback_data="admin_system")],
+        [InlineKeyboardButton("📋 Всі проекти", callback_data="admin_all_projects")],
+        [InlineKeyboardButton("➕ Створити проект для користувача", callback_data="admin_create_for_user")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_users_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру управління користувачами"""
+    keyboard = [
+        [InlineKeyboardButton("👥 Список користувачів", callback_data="admin_list_users")],
+        [InlineKeyboardButton("➕ Додати користувача", callback_data="admin_add_user")],
+        [InlineKeyboardButton("👑 Додати адміна", callback_data="admin_add_admin")],
+        [InlineKeyboardButton("🔍 Пошук користувача", callback_data="admin_search_user")],
+        [InlineKeyboardButton("🗑️ Видалити користувача", callback_data="admin_delete_user")],
+        [InlineKeyboardButton("🔄 Змінити роль", callback_data="admin_change_role")],
+        [InlineKeyboardButton("🔐 Скинути пароль", callback_data="admin_reset_password")],
+        [InlineKeyboardButton("🔁 Пересилання (користувач)", callback_data="admin_forward")],
+        [InlineKeyboardButton("📊 Статистика користувачів", callback_data="admin_user_stats")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_forward_keyboard(target_user_id: int) -> InlineKeyboardMarkup:
+    """Клавіатура керування пересиланням для конкретного користувача"""
+    status = project_manager.get_forward_status(target_user_id)
+    enabled = status.get('enabled', False)
+    keyboard = []
+    if enabled:
+        keyboard.append([InlineKeyboardButton("🔴 Вимкнути", callback_data=f"admin_forward_disable_{target_user_id}")])
+        keyboard.append([InlineKeyboardButton("✏️ Змінити канал", callback_data=f"admin_forward_set_{target_user_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton("🟢 Увімкнути", callback_data=f"admin_forward_enable_{target_user_id}")])
+        keyboard.append([InlineKeyboardButton("📝 Встановити канал", callback_data=f"admin_forward_set_{target_user_id}")])
+    keyboard.append([
+        InlineKeyboardButton("📊 Статус", callback_data=f"admin_forward_status_{target_user_id}"),
+        InlineKeyboardButton("🧪 Тест", callback_data=f"admin_forward_test_{target_user_id}")
+    ])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_users")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_system_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру системного управління"""
+    keyboard = [
+        [InlineKeyboardButton("📊 Статистика системи", callback_data="admin_system_stats")],
+        [InlineKeyboardButton("📋 Логи системи", callback_data="admin_system_logs")],
+        [InlineKeyboardButton("🔄 Очистити сесії", callback_data="admin_cleanup_sessions")],
+        [InlineKeyboardButton("💾 Створити бекап", callback_data="admin_create_backup")],
+        [InlineKeyboardButton("⚠️ Скинути систему", callback_data="admin_reset_system")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def escape_markdown(text: str) -> str:
     """Екранувати спеціальні символи для Markdown"""
     if not text:
@@ -349,13 +674,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         selenium_status = "🚀 Активний" if selenium_twitter_monitor and selenium_twitter_monitor.monitoring_active else "⏸️ Неактивний"
         selenium_accounts = len(selenium_twitter_monitor.monitoring_accounts) if selenium_twitter_monitor else 0
         
+        # Отримуємо роль користувача
+        user_role = access_manager.get_user_role(user_id)
+        role_emoji = "👑" if user_role == "admin" else "👤"
+        role_text = "Адміністратор" if user_role == "admin" else "Користувач"
+        
         await update.message.reply_text(
             f"👋 Привіт, {username}!\n\n"
-            "Ви вже авторизовані в системі.\n\n"
+            f"{role_emoji} **Роль:** {role_text}\n"
+            "✅ Ви авторизовані в системі.\n\n"
             f"🚀 **Selenium Twitter моніторинг:** {selenium_status}\n"
             f"📊 **Акаунтів для моніторингу:** {selenium_accounts}\n\n"
             "Використовуйте меню нижче для навігації.",
-            reply_markup=get_main_menu_keyboard(),
+            reply_markup=get_main_menu_keyboard(user_id),
             parse_mode='Markdown'
         )
     else:
@@ -507,6 +838,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     message_text = update.message.text
     
+    # Автонастройка каналу через переслане повідомлення з каналу/групи
+    # Якщо адмін у стані налаштування каналу для іншого користувача — обробимо в спец. хендлері нижче
+    try:
+        fwd_chat = getattr(update.message, 'forward_from_chat', None)
+        if fwd_chat and update.message.chat.type == 'private':
+            if not (user_id in user_states and user_states[user_id]['state'] == 'admin_forward_set_channel'):
+                await handle_forwarded_channel_setup(update, context, fwd_chat)
+                return
+    except Exception:
+        pass
+    
     # Якщо користувач очікує введення пароля для нової системи
     if user_id in waiting_for_password:
         # Спробуємо авторизувати через нову систему
@@ -517,7 +859,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(
                 "✅ **Авторизація успішна!**\n\n"
                 "Оберіть дію з меню нижче:",
-                reply_markup=get_main_menu_keyboard(),
+                reply_markup=get_main_menu_keyboard(user_id),
                 parse_mode='Markdown'
             )
         else:
@@ -547,12 +889,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await handle_project_creation(update, context)
         elif user_states[user_id]['state'] == 'setting_forward_channel':
             await handle_forward_channel_setting(update, context)
+        elif user_states[user_id]['state'] == 'admin_forward_select_user':
+            await handle_admin_forward_select_user(update, context)
+        elif user_states[user_id]['state'] == 'admin_forward_set_channel':
+            await handle_admin_forward_set_channel(update, context)
+        elif user_states[user_id]['state'] == 'admin_creating_project_for_user':
+            await handle_admin_create_project_for_user(update, context)
         elif user_states[user_id]['state'] == 'adding_twitter':
             await handle_twitter_addition(update, context)
         elif user_states[user_id]['state'] == 'adding_discord':
             await handle_discord_addition(update, context)
         elif user_states[user_id]['state'] == 'adding_selenium':
             await handle_selenium_addition(update, context)
+        elif user_states[user_id]['state'] == 'admin_creating_user':
+            await handle_admin_user_creation(update, context)
+        elif user_states[user_id]['state'] == 'admin_creating_admin':
+            await handle_admin_admin_creation(update, context)
+        elif user_states[user_id]['state'] == 'admin_searching_user':
+            await handle_admin_user_search(update, context)
+        elif user_states[user_id]['state'] == 'admin_deleting_user':
+            await handle_admin_user_deletion(update, context)
+        elif user_states[user_id]['state'] == 'admin_changing_role':
+            await handle_admin_role_change(update, context)
+        elif user_states[user_id]['state'] == 'admin_resetting_password':
+            await handle_admin_password_reset(update, context)
+        elif user_states[user_id]['state'] == 'admin_resetting_system':
+            await handle_admin_system_reset(update, context)
         return
     
     # Обробляємо команди
@@ -563,7 +925,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Ви написали: {message_text}\n"
             f"Час до закінчення сесії: {security_manager.get_session_time_left(user_id)} секунд\n\n"
             f"Використайте меню для навігації:",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
         )
 
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> None:
@@ -625,7 +987,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if callback_data == "main_menu":
         await query.edit_message_text(
             "🏠 Головне меню\n\nОберіть дію:",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
         )
     elif callback_data == "add_project":
         await query.edit_message_text(
@@ -751,38 +1113,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-    elif callback_data.startswith("delete_twitter_"):
-        project_id = int(callback_data.replace("delete_twitter_", ""))
-        try:
-            project_manager.remove_project(user_id, project_id)
-            await query.edit_message_text(
-                "✅ Twitter проект успішно видалено!",
-                reply_markup=get_twitter_projects_keyboard(user_id)
-            )
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ Помилка видалення проекту: {e}",
-                reply_markup=get_twitter_projects_keyboard(user_id)
-            )
-    elif callback_data.startswith("delete_discord_"):
-        project_id = int(callback_data.replace("delete_discord_", ""))
-        try:
-            project_manager.remove_project(user_id, project_id)
-            await query.edit_message_text(
-                "✅ Discord проект успішно видалено!",
-                reply_markup=get_discord_projects_keyboard(user_id)
-            )
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ Помилка видалення проекту: {e}",
-                reply_markup=get_discord_projects_keyboard(user_id)
-            )
     elif callback_data.startswith("delete_selenium_"):
         username = callback_data.replace("delete_selenium_", "")
         try:
             project_manager.remove_selenium_account(username)
             if selenium_twitter_monitor:
                 selenium_twitter_monitor.remove_account(username)
+            # Синхронізація після змін
+            sync_monitors_with_projects()
             await query.edit_message_text(
                 f"✅ Selenium акаунт @{username} успішно видалено!",
                 reply_markup=get_selenium_accounts_keyboard()
@@ -857,7 +1195,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if not projects:
             await query.edit_message_text(
                 "🔧 **Менеджер акаунтів**\n\n❌ У вас немає проектів для моніторингу.\n\nДодайте проекти через меню бота.",
-                reply_markup=get_main_menu_keyboard()
+                reply_markup=get_main_menu_keyboard(user_id)
             )
             return
         
@@ -902,7 +1240,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if not discord_projects:
             await query.edit_message_text(
                 "📜 Історія Discord\n\n❌ У вас немає Discord проектів для перегляду історії.\n\nДодайте Discord проект спочатку.",
-                reply_markup=get_main_menu_keyboard()
+                reply_markup=get_main_menu_keyboard(user_id)
             )
         else:
             await query.edit_message_text(
@@ -1212,6 +1550,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             # Перезавантажуємо дані
             project_manager.load_data()
+            # Проводимо синхронізацію моніторів
+            sync_monitors_with_projects()
             
             # Перезапускаємо Discord моніторинг
             if discord_monitor:
@@ -1231,6 +1571,654 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"❌ **Помилка перезавантаження**\n\n{str(e)}",
                 reply_markup=get_diagnostics_keyboard()
             )
+    # Видалення проектів з меню: Twitter
+    elif callback_data.startswith("delete_twitter_"):
+        project_id = int(callback_data.split('_')[-1])
+        project = project_manager.get_project_by_id(user_id, project_id)
+        if not project:
+            await query.edit_message_text("❌ Проект не знайдено.", reply_markup=get_twitter_projects_keyboard(user_id))
+            return
+        username = extract_twitter_username(project.get('url', ''))
+        if project_manager.remove_project(user_id, project_id):
+            # Зупиняємо моніторинг цього акаунта відразу
+            try:
+                if twitter_monitor and username:
+                    twitter_monitor.remove_account(username)
+            except Exception:
+                pass
+            if selenium_twitter_monitor and username in getattr(selenium_twitter_monitor, 'monitoring_accounts', set()):
+                selenium_twitter_monitor.monitoring_accounts.discard(username)
+                if username in selenium_twitter_monitor.seen_tweets:
+                    del selenium_twitter_monitor.seen_tweets[username]
+            # Також приберемо із збережених Selenium акаунтів, якщо це був він
+            try:
+                project_manager.remove_selenium_account(username)
+            except Exception:
+                pass
+            # Синхронізація після змін
+            sync_monitors_with_projects()
+            await query.edit_message_text(
+                f"✅ Twitter акаунт @{username} видалено та зупинено моніторинг.",
+                reply_markup=get_twitter_projects_keyboard(user_id)
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Помилка видалення Twitter проекту.",
+                reply_markup=get_twitter_projects_keyboard(user_id)
+            )
+    # Видалення проектів з меню: Discord
+    elif callback_data.startswith("delete_discord_"):
+        project_id = int(callback_data.split('_')[-1])
+        project = project_manager.get_project_by_id(user_id, project_id)
+        if not project:
+            await query.edit_message_text("❌ Проект не знайдено.", reply_markup=get_discord_projects_keyboard(user_id))
+            return
+        channel_id = extract_discord_channel_id(project.get('url', ''))
+        if project_manager.remove_project(user_id, project_id):
+            # Зупиняємо моніторинг цього каналу відразу
+            if discord_monitor and channel_id in getattr(discord_monitor, 'monitoring_channels', set()):
+                discord_monitor.monitoring_channels.discard(channel_id)
+                if channel_id in discord_monitor.last_message_ids:
+                    del discord_monitor.last_message_ids[channel_id]
+            # Синхронізація після змін
+            sync_monitors_with_projects()
+            await query.edit_message_text(
+                f"✅ Discord канал {channel_id} видалено та зупинено моніторинг.",
+                reply_markup=get_discord_projects_keyboard(user_id)
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Помилка видалення Discord проекту.",
+                reply_markup=get_discord_projects_keyboard(user_id)
+            )
+    
+    # Обробники адміністративної панелі
+    elif callback_data == "admin_panel":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ **Доступ заборонено!**\n\nТільки адміністратор має доступ до цієї панелі.",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "👑 **Адміністративна панель**\n\n"
+            "Оберіть розділ для управління:",
+            reply_markup=get_admin_panel_keyboard()
+        )
+    elif callback_data == "admin_users":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+            
+        await query.edit_message_text(
+            "👥 **Управління користувачами**\n\n"
+            "Оберіть дію:",
+            reply_markup=get_admin_users_keyboard()
+        )
+    elif callback_data == "admin_create_for_user":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text("❌ Доступ заборонено!", reply_markup=get_main_menu_keyboard(user_id))
+            return
+        # Перший крок: ввести Telegram ID цільового користувача
+        user_states[user_id] = {
+            'state': 'admin_creating_project_for_user',
+            'data': {'step': 'telegram_id'}
+        }
+        await query.edit_message_text(
+            "➕ **Створення проекту для користувача**\n\nВведіть Telegram ID користувача:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="admin_panel")]])
+        )
+    elif callback_data == "admin_forward":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        # Запитуємо target user id
+        user_states[user_id] = {
+            'state': 'admin_forward_select_user',
+            'data': {}
+        }
+        await query.edit_message_text(
+            "🔁 **Керування пересиланням (користувач)**\n\nВведіть Telegram ID користувача:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")]])
+        )
+    elif callback_data == "admin_stats":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+            
+        try:
+            stats = project_manager.get_project_statistics(user_id)
+            users_list = project_manager.get_all_users_with_projects(user_id)
+            
+            stats_text = (
+                f"📊 **Статистика системи**\n\n"
+                f"👥 Всього користувачів: {stats['total_users']}\n"
+                f"✅ Активних користувачів: {stats['active_users']}\n"
+                f"📋 Всього проектів: {stats['total_projects']}\n"
+                f"🐦 Twitter проектів: {stats['twitter_projects']}\n"
+                f"💬 Discord проектів: {stats['discord_projects']}\n"
+                f"🚀 Selenium акаунтів: {stats['selenium_accounts']}\n\n"
+                f"👑 **Адміністраторів:** {len(access_manager.get_all_admins())}\n"
+                f"👤 **Звичайних користувачів:** {len(access_manager.get_all_users_by_role('user'))}"
+            )
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=get_admin_panel_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання статистики**\n\n{str(e)}",
+                reply_markup=get_admin_panel_keyboard()
+            )
+    elif callback_data == "admin_list_users":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+            
+        try:
+            all_users = access_manager.get_all_users()
+            
+            if not all_users:
+                await query.edit_message_text(
+                    "👥 **Список користувачів**\n\n"
+                    "Користувачів не знайдено.",
+                    reply_markup=get_admin_users_keyboard()
+                )
+                return
+            
+            users_text = "👥 **Список користувачів**\n\n"
+            
+            for i, user in enumerate(all_users[:10], 1):  # Показуємо перших 10
+                role_emoji = "👑" if user.get('role', 'user') == 'admin' else "👤"
+                status_emoji = "✅" if user.get('is_active', True) else "❌"
+                
+                users_text += (
+                    f"{i}. {role_emoji} {user.get('username', 'Без імені')}\n"
+                    f"   ID: {user.get('telegram_id')}\n"
+                    f"   Статус: {status_emoji}\n"
+                    f"   Створено: {user.get('created_at', '')[:10]}\n\n"
+                )
+            
+            if len(all_users) > 10:
+                users_text += f"... та ще {len(all_users) - 10} користувачів"
+            
+            await query.edit_message_text(
+                users_text,
+                reply_markup=get_admin_users_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання списку користувачів**\n\n{str(e)}",
+                reply_markup=get_admin_users_keyboard()
+            )
+    elif callback_data == "admin_all_projects":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+            
+        try:
+            all_projects = project_manager.get_all_projects(user_id)
+            total_projects = sum(len(projects) for projects in all_projects.values())
+            
+            if total_projects == 0:
+                await query.edit_message_text(
+                    "📋 **Всі проекти**\n\n"
+                    "Проектів не знайдено.",
+                    reply_markup=get_admin_panel_keyboard()
+                )
+                return
+            
+            projects_text = f"📋 **Всі проекти** (Всього: {total_projects})\n\n"
+            
+            shown_projects = 0
+            for user_id_str, projects in all_projects.items():
+                if shown_projects >= 5:  # Показуємо тільки перші 5 користувачів
+                    break
+                    
+                user_data = access_manager.get_user_by_telegram_id(int(user_id_str))
+                username = user_data.get('username', 'Без імені') if user_data else 'Невідомий'
+                
+                projects_text += f"👤 **{username}** ({len(projects)} проектів):\n"
+                
+                for project in projects[:3]:  # По 3 проекти на користувача
+                    platform_emoji = "🐦" if project.get('platform') == 'twitter' else "💬"
+                    projects_text += f"   {platform_emoji} {project.get('name', 'Без назви')}\n"
+                
+                if len(projects) > 3:
+                    projects_text += f"   ... та ще {len(projects) - 3} проектів\n"
+                
+                projects_text += "\n"
+                shown_projects += 1
+            
+            if len(all_projects) > 5:
+                projects_text += f"... та ще {len(all_projects) - 5} користувачів з проектами"
+            
+            await query.edit_message_text(
+                projects_text,
+                reply_markup=get_admin_panel_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання проектів**\n\n{str(e)}",
+                reply_markup=get_admin_panel_keyboard()
+            )
+    elif callback_data == "admin_add_user":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        # Встановлюємо стан для створення користувача
+        user_states[user_id] = {
+            'state': 'admin_creating_user',
+            'data': {'step': 'telegram_id'}
+        }
+        
+        await query.edit_message_text(
+            "👤 **Створення нового користувача**\n\n"
+            "Введіть Telegram ID користувача:\n\n"
+            "💡 **Приклад:** 123456789",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")
+            ]])
+        )
+    elif callback_data == "admin_add_admin":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        # Встановлюємо стан для створення адміністратора
+        user_states[user_id] = {
+            'state': 'admin_creating_admin',
+            'data': {'step': 'telegram_id'}
+        }
+        
+        await query.edit_message_text(
+            "👑 **Створення нового адміністратора**\n\n"
+            "Введіть Telegram ID адміністратора:\n\n"
+            "💡 **Приклад:** 123456789",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")
+            ]])
+        )
+    elif callback_data == "admin_search_user":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        # Встановлюємо стан для пошуку
+        user_states[user_id] = {
+            'state': 'admin_searching_user',
+            'data': {}
+        }
+        
+        await query.edit_message_text(
+            "🔍 **Пошук користувача**\n\n"
+            "Введіть username або Telegram ID для пошуку:\n\n"
+            "💡 **Приклади:**\n"
+            "• JohnDoe (пошук за username)\n"
+            "• 123456789 (пошук за Telegram ID)",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")
+            ]])
+        )
+    elif callback_data == "admin_delete_user":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        # Встановлюємо стан для видалення
+        user_states[user_id] = {
+            'state': 'admin_deleting_user',
+            'data': {}
+        }
+        
+        await query.edit_message_text(
+            "🗑️ **Видалення користувача**\n\n"
+            "⚠️ **УВАГА!** Ця дія видалить користувача повністю!\n\n"
+            "Введіть Telegram ID користувача для видалення:\n\n"
+            "💡 **Приклад:** 123456789",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")
+            ]])
+        )
+    elif callback_data == "admin_change_role":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        # Встановлюємо стан для зміни ролі
+        user_states[user_id] = {
+            'state': 'admin_changing_role',
+            'data': {'step': 'telegram_id'}
+        }
+        
+        await query.edit_message_text(
+            "🔄 **Зміна ролі користувача**\n\n"
+            "Введіть Telegram ID користувача:\n\n"
+            "💡 **Приклад:** 123456789",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")
+            ]])
+        )
+    elif callback_data == "admin_reset_password":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        # Встановлюємо стан для скидання паролю
+        user_states[user_id] = {
+            'state': 'admin_resetting_password',
+            'data': {'step': 'telegram_id'}
+        }
+        
+        await query.edit_message_text(
+            "🔐 **Скидання паролю користувача**\n\n"
+            "Введіть Telegram ID користувача:\n\n"
+            "💡 **Приклад:** 123456789",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")
+            ]])
+        )
+    elif callback_data == "admin_user_stats":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            stats = access_manager.get_user_statistics()
+            
+            stats_text = (
+                f"📊 **Статистика користувачів**\n\n"
+                f"👥 **Загальна статистика:**\n"
+                f"• Всього користувачів: {stats['total_users']}\n"
+                f"• Активних: {stats['active_users']}\n"
+                f"• Неактивних: {stats['inactive_users']}\n\n"
+                f"👑 **За ролями:**\n"
+                f"• Адміністраторів: {stats['admin_users']}\n"
+                f"• Звичайних користувачів: {stats['regular_users']}\n\n"
+                f"🟢 **Активність:**\n"
+                f"• Онлайн зараз: {stats['online_users']}\n"
+                f"• Входили за останні 24 год: {stats['recent_logins']}"
+            )
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=get_admin_users_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання статистики**\n\n{str(e)}",
+                reply_markup=get_admin_users_keyboard()
+            )
+    elif callback_data == "admin_system_stats":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            stats = access_manager.get_system_statistics()
+            
+            stats_text = (
+                f"📊 **Системна статистика**\n\n"
+                f"👥 **Користувачі:**\n"
+                f"• Всього користувачів: {stats['total_users']}\n"
+                f"• Активних сесій: {stats['active_sessions']}\n\n"
+                f"📋 **Проекти:**\n"
+                f"• Всього проектів: {stats['total_projects']}\n"
+                f"• Активних моніторів: {stats['active_monitors']}\n\n"
+                f"⚙️ **Система:**\n"
+                f"• Статус: {stats['system_uptime']}\n"
+                f"• Останній бекап: {stats['last_backup']}\n"
+                f"• Використання сховища: {stats['storage_usage']} символів"
+            )
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=get_admin_system_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання статистики**\n\n{str(e)}",
+                reply_markup=get_admin_system_keyboard()
+            )
+    elif callback_data == "admin_system_logs":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            logs = access_manager.get_logs(20)  # Останні 20 записів
+            
+            if not logs:
+                logs_text = "📋 **Логи системи**\n\n❌ Логи відсутні"
+            else:
+                logs_text = "📋 **Логи системи** (останні 20 записів)\n\n"
+                for log in logs:
+                    logs_text += f"• {log}\n"
+            
+            await query.edit_message_text(
+                logs_text,
+                reply_markup=get_admin_system_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання логів**\n\n{str(e)}",
+                reply_markup=get_admin_system_keyboard()
+            )
+    elif callback_data == "admin_cleanup_sessions":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            cleaned_count = access_manager.cleanup_inactive_sessions()
+            
+            if cleaned_count > 0:
+                await query.edit_message_text(
+                    f"🔄 **Очищення сесій завершено!**\n\n"
+                    f"✅ Очищено {cleaned_count} неактивних сесій\n\n"
+                    f"Неактивні користувачі були розлогінені.",
+                    reply_markup=get_admin_system_keyboard()
+                )
+            else:
+                await query.edit_message_text(
+                    f"🔄 **Очищення сесій завершено!**\n\n"
+                    f"ℹ️ Неактивних сесій не знайдено\n\n"
+                    f"Всі сесії активні.",
+                    reply_markup=get_admin_system_keyboard()
+                )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка очищення сесій**\n\n{str(e)}",
+                reply_markup=get_admin_system_keyboard()
+            )
+    elif callback_data == "admin_create_backup":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            if access_manager.backup_data():
+                await query.edit_message_text(
+                    f"💾 **Резервна копія створена!**\n\n"
+                    f"✅ Дані успішно збережено\n\n"
+                    f"Резервна копія збережена в папці 'backups'.",
+                    reply_markup=get_admin_system_keyboard()
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ **Помилка створення резервної копії!**\n\n"
+                    f"Спробуйте ще раз.",
+                    reply_markup=get_admin_system_keyboard()
+                )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка створення резервної копії**\n\n{str(e)}",
+                reply_markup=get_admin_system_keyboard()
+            )
+    elif callback_data == "admin_reset_system":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        # Встановлюємо стан для підтвердження скидання
+        user_states[user_id] = {
+            'state': 'admin_resetting_system',
+            'data': {}
+        }
+        
+        await query.edit_message_text(
+            "⚠️ **СКИДАННЯ СИСТЕМИ**\n\n"
+            "🚨 **УВАГА!** Ця дія видалить ВСІХ користувачів крім адміністраторів!\n\n"
+            "📋 **Що буде видалено:**\n"
+            "• Всіх звичайних користувачів\n"
+            "• Всі їхні проекти\n"
+            "• Всі активні сесії\n\n"
+            "✅ **Що буде збережено:**\n"
+            "• Всіх адміністраторів\n"
+            "• Резервна копія буде створена автоматично\n\n"
+            "🔐 **Для підтвердження введіть:** CONFIRM_RESET",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Скасувати", callback_data="admin_system")
+            ]])
+        )
+    # Адмін керування пересиланням: дії з кнопок
+    elif callback_data.startswith("admin_forward_enable_"):
+        if not access_manager.is_admin(user_id):
+            return
+        target_id = int(callback_data.split('_')[-1])
+        project_manager.enable_forward(target_id)
+        await query.edit_message_text(
+            f"🟢 Пересилання увімкнено для `{target_id}`",
+            reply_markup=get_admin_forward_keyboard(target_id),
+            parse_mode='Markdown'
+        )
+    elif callback_data.startswith("admin_forward_disable_"):
+        if not access_manager.is_admin(user_id):
+            return
+        target_id = int(callback_data.split('_')[-1])
+        project_manager.disable_forward(target_id)
+        await query.edit_message_text(
+            f"🔴 Пересилання вимкнено для `{target_id}`",
+            reply_markup=get_admin_forward_keyboard(target_id),
+            parse_mode='Markdown'
+        )
+    elif callback_data.startswith("admin_forward_status_"):
+        if not access_manager.is_admin(user_id):
+            return
+        target_id = int(callback_data.split('_')[-1])
+        status = project_manager.get_forward_status(target_id)
+        enabled = status.get('enabled', False)
+        channel = status.get('channel_id') or '—'
+        await query.edit_message_text(
+            f"📊 Статус пересилання для `{target_id}`\n\nСтатус: {'🟢 увімкнено' if enabled else '🔴 вимкнено'}\nКанал: `{channel}`",
+            reply_markup=get_admin_forward_keyboard(target_id),
+            parse_mode='Markdown'
+        )
+    elif callback_data.startswith("admin_forward_test_"):
+        if not access_manager.is_admin(user_id):
+            return
+        target_id = int(callback_data.split('_')[-1])
+        forward_channel = project_manager.get_forward_channel(target_id)
+        if not forward_channel:
+            await query.edit_message_text(
+                f"❌ У користувача `{target_id}` не налаштований канал.",
+                reply_markup=get_admin_forward_keyboard(target_id),
+                parse_mode='Markdown'
+            )
+        else:
+            try:
+                test_text = (
+                    f"🧪 Тест пересилання\n\n"
+                    f"Це тестове повідомлення від адміністратора для користувача `{target_id}`."
+                )
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                data = {
+                    'chat_id': normalize_chat_id(forward_channel),
+                    'text': test_text,
+                    'parse_mode': 'Markdown'
+                }
+                r = requests.post(url, data=data, timeout=5)
+                if r.status_code == 200:
+                    await query.edit_message_text(
+                        f"✅ Тестове повідомлення надіслано у `{normalize_chat_id(forward_channel)}`",
+                        reply_markup=get_admin_forward_keyboard(target_id),
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"❌ Помилка надсилання ({r.status_code}). Перевірте права бота у каналі.",
+                        reply_markup=get_admin_forward_keyboard(target_id)
+                    )
+            except Exception as e:
+                await query.edit_message_text(
+                    f"❌ Виняток при надсиланні: {e}",
+                    reply_markup=get_admin_forward_keyboard(target_id)
+                )
+    elif callback_data.startswith("admin_forward_set_"):
+        if not access_manager.is_admin(user_id):
+            return
+        target_id = int(callback_data.split('_')[-1])
+        # Переводимо у стан очікування ID каналу
+        user_states[user_id] = {'state': 'admin_forward_set_channel', 'data': {'target_id': target_id}}
+        await query.edit_message_text(
+            f"📝 Перешліть повідомлення з потрібного каналу АБО введіть його ID для користувача `{target_id}`:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")]]),
+            parse_mode='Markdown'
+        )
 
 async def handle_project_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник створення проекту"""
@@ -1287,12 +2275,12 @@ async def handle_project_creation(update: Update, context: ContextTypes.DEFAULT_
             )
             await update.message.reply_text(
                 success_text,
-                reply_markup=get_main_menu_keyboard()
+                reply_markup=get_main_menu_keyboard(user_id)
             )
         else:
             await update.message.reply_text(
                 "❌ Помилка при додаванні проекту. Спробуйте ще раз.",
-                reply_markup=get_main_menu_keyboard()
+                reply_markup=get_main_menu_keyboard(user_id)
             )
         
         # Очищуємо стан користувача
@@ -1322,17 +2310,92 @@ async def handle_forward_channel_setting(update: Update, context: ContextTypes.D
         )
         await update.message.reply_text(
             success_text,
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
         )
     else:
         await update.message.reply_text(
             "❌ Помилка встановлення каналу. Спробуйте ще раз.",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
         )
     
     # Очищуємо стан користувача
     if user_id in user_states:
         del user_states[user_id]
+
+@require_auth
+async def handle_admin_create_project_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Майстер створення проекту для іншого користувача (адмін)"""
+    admin_id = update.effective_user.id
+    state = user_states.get(admin_id, {}).get('data', {})
+    step = state.get('step', 'telegram_id')
+    text = update.message.text.strip()
+    
+    # Крок 1: вибір користувача
+    if step == 'telegram_id':
+        if not text.isdigit():
+            await update.message.reply_text("❌ Введіть числовий Telegram ID користувача:")
+            return
+        target_id = int(text)
+        target = access_manager.get_user_by_telegram_id(target_id)
+        if not target:
+            await update.message.reply_text("❌ Користувача не знайдено. Введіть інший Telegram ID:")
+            return
+        state['target_id'] = target_id
+        state['step'] = 'platform'
+        await update.message.reply_text(
+            "🌐 Вкажіть платформу проекту: 'twitter' або 'discord'",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="admin_panel")]])
+        )
+        return
+    
+    # Крок 2: платформа
+    if step == 'platform':
+        platform = text.lower()
+        if platform not in ['twitter', 'discord']:
+            await update.message.reply_text("❌ Невірна платформа. Введіть 'twitter' або 'discord':")
+            return
+        state['platform'] = platform
+        state['step'] = 'name'
+        await update.message.reply_text("📝 Введіть назву проекту:")
+        return
+    
+    # Крок 3: назва
+    if step == 'name':
+        state['name'] = text
+        state['step'] = 'url'
+        if state['platform'] == 'twitter':
+            await update.message.reply_text("🔗 Введіть посилання на Twitter/X Без @ (напр. username):")
+        else:
+            await update.message.reply_text("🔗 Введіть посилання на Discord канал (напр. https://discord.com/channels/<server>/<channel>):")
+        return
+    
+    # Крок 4: URL та створення
+    if step == 'url':
+        state['url'] = text
+        project_data = {
+            'name': state['name'],
+            'platform': state['platform'],
+            'url': state['url'],
+            'description': f"Адміном створено для {state['target_id']}"
+        }
+        # Створюємо проект від імені target_id
+        ok = project_manager.add_project(admin_id, project_data, target_user_id=state['target_id'])
+        if ok:
+            # Додаємо у відповідний монітор одразу
+            if state['platform'] == 'twitter':
+                username = extract_twitter_username(state['url'])
+                if twitter_monitor and username:
+                    twitter_monitor.add_account(username)
+            else:
+                if discord_monitor:
+                    discord_monitor.add_channel(state['url'])
+            sync_monitors_with_projects()
+            await update.message.reply_text("✅ Проект створено і додано до моніторингу.")
+        else:
+            await update.message.reply_text("❌ Не вдалося створити проект.")
+        # Завершуємо майстер
+        if admin_id in user_states:
+            del user_states[admin_id]
 
 async def handle_twitter_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник додавання Twitter акаунта"""
@@ -1416,6 +2479,602 @@ async def handle_discord_addition(update: Update, context: ContextTypes.DEFAULT_
     # Очищаємо стан
     del user_states[user_id]
 
+async def handle_admin_user_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник створення користувача адміністратором"""
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    state_data = user_states[user_id]['data']
+    
+    try:
+        if state_data['step'] == 'telegram_id':
+            # Перевіряємо чи це число
+            if not message_text.isdigit():
+                await update.message.reply_text(
+                    "❌ **Неправильний формат!**\n\n"
+                    "Telegram ID повинен бути числом.\n"
+                    "Введіть Telegram ID ще раз:"
+                )
+                return
+            
+            telegram_id = int(message_text)
+            
+            # Перевіряємо чи користувач вже існує
+            existing_user = access_manager.get_user_by_telegram_id(telegram_id)
+            if existing_user:
+                await update.message.reply_text(
+                    f"❌ **Користувач вже існує!**\n\n"
+                    f"Користувач з Telegram ID {telegram_id} вже зареєстрований в системі.\n"
+                    f"Роль: {'Адміністратор' if existing_user.get('role') == 'admin' else 'Користувач'}\n\n"
+                    f"Введіть інший Telegram ID:"
+                )
+                return
+            
+            # Зберігаємо Telegram ID та переходимо до наступного кроку
+            state_data['telegram_id'] = telegram_id
+            state_data['step'] = 'username'
+            
+            await update.message.reply_text(
+                f"✅ **Telegram ID:** {telegram_id}\n\n"
+                f"👤 **Введіть username користувача:**\n\n"
+                f"💡 **Приклад:** JohnDoe\n"
+                f"💡 **Примітка:** Username може бути порожнім"
+            )
+            
+        elif state_data['step'] == 'username':
+            # Зберігаємо username та переходимо до паролю
+            username = message_text.strip()
+            state_data['username'] = username
+            state_data['step'] = 'password'
+            
+            await update.message.reply_text(
+                f"✅ **Telegram ID:** {state_data['telegram_id']}\n"
+                f"✅ **Username:** {username or 'Не вказано'}\n\n"
+                f"🔐 **Введіть пароль користувача:**\n\n"
+                f"💡 **Приклад:** mypassword123\n"
+                f"💡 **Примітка:** Якщо залишити порожнім, буде використано пароль за замовчуванням"
+            )
+            
+        elif state_data['step'] == 'password':
+            # Зберігаємо пароль та створюємо користувача
+            password = message_text.strip()
+            
+            # Створюємо користувача
+            created_user_id = access_manager.add_user(
+                state_data['telegram_id'],
+                state_data['username'],
+                password if password else None
+            )
+            
+            if created_user_id:
+                await update.message.reply_text(
+                    f"🎉 **Користувач успішно створений!**\n\n"
+                    f"👤 **Username:** {state_data['username'] or 'Не вказано'}\n"
+                    f"🆔 **Telegram ID:** {state_data['telegram_id']}\n"
+                    f"🔐 **Пароль:** {password or 'за замовчуванням'}\n"
+                    f"👑 **Роль:** Користувач\n\n"
+                    f"Користувач може увійти в систему командою /login",
+                    reply_markup=get_admin_users_keyboard(),
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ **Помилка створення користувача!**\n\n"
+                    "Спробуйте ще раз.",
+                    reply_markup=get_admin_users_keyboard()
+                )
+            
+            # Очищаємо стан
+            del user_states[user_id]
+            
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **Помилка:** {str(e)}\n\n"
+            f"Спробуйте ще раз.",
+            reply_markup=get_admin_users_keyboard()
+        )
+        # Очищаємо стан при помилці
+        if user_id in user_states:
+            del user_states[user_id]
+
+async def handle_admin_admin_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник створення адміністратора адміністратором"""
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    state_data = user_states[user_id]['data']
+    
+    try:
+        if state_data['step'] == 'telegram_id':
+            # Перевіряємо чи це число
+            if not message_text.isdigit():
+                await update.message.reply_text(
+                    "❌ **Неправильний формат!**\n\n"
+                    "Telegram ID повинен бути числом.\n"
+                    "Введіть Telegram ID ще раз:"
+                )
+                return
+            
+            telegram_id = int(message_text)
+            
+            # Перевіряємо чи користувач вже існує
+            existing_user = access_manager.get_user_by_telegram_id(telegram_id)
+            if existing_user:
+                await update.message.reply_text(
+                    f"❌ **Користувач вже існує!**\n\n"
+                    f"Користувач з Telegram ID {telegram_id} вже зареєстрований в системі.\n"
+                    f"Роль: {'Адміністратор' if existing_user.get('role') == 'admin' else 'Користувач'}\n\n"
+                    f"Введіть інший Telegram ID:"
+                )
+                return
+            
+            # Зберігаємо Telegram ID та переходимо до наступного кроку
+            state_data['telegram_id'] = telegram_id
+            state_data['step'] = 'username'
+            
+            await update.message.reply_text(
+                f"✅ **Telegram ID:** {telegram_id}\n\n"
+                f"👤 **Введіть username адміністратора:**\n\n"
+                f"💡 **Приклад:** AdminJohn\n"
+                f"💡 **Примітка:** Username може бути порожнім"
+            )
+            
+        elif state_data['step'] == 'username':
+            # Зберігаємо username та переходимо до паролю
+            username = message_text.strip()
+            state_data['username'] = username
+            state_data['step'] = 'password'
+            
+            await update.message.reply_text(
+                f"✅ **Telegram ID:** {state_data['telegram_id']}\n"
+                f"✅ **Username:** {username or 'Не вказано'}\n\n"
+                f"🔐 **Введіть пароль адміністратора:**\n\n"
+                f"💡 **Приклад:** adminpass123\n"
+                f"💡 **Примітка:** Якщо залишити порожнім, буде використано пароль за замовчуванням"
+            )
+            
+        elif state_data['step'] == 'password':
+            # Зберігаємо пароль та створюємо адміністратора
+            password = message_text.strip()
+            
+            # Створюємо адміністратора
+            created_user_id = access_manager.create_admin_user(
+                state_data['telegram_id'],
+                state_data['username'],
+                password if password else None
+            )
+            
+            if created_user_id:
+                await update.message.reply_text(
+                    f"🎉 **Адміністратор успішно створений!**\n\n"
+                    f"👤 **Username:** {state_data['username'] or 'Не вказано'}\n"
+                    f"🆔 **Telegram ID:** {state_data['telegram_id']}\n"
+                    f"🔐 **Пароль:** {password or 'за замовчуванням'}\n"
+                    f"👑 **Роль:** Адміністратор\n\n"
+                    f"Адміністратор може увійти в систему командою /login",
+                    reply_markup=get_admin_users_keyboard(),
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ **Помилка створення адміністратора!**\n\n"
+                    "Спробуйте ще раз.",
+                    reply_markup=get_admin_users_keyboard()
+                )
+            
+            # Очищаємо стан
+            del user_states[user_id]
+            
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **Помилка:** {str(e)}\n\n"
+            f"Спробуйте ще раз.",
+            reply_markup=get_admin_users_keyboard()
+        )
+        # Очищаємо стан при помилці
+        if user_id in user_states:
+            del user_states[user_id]
+
+async def handle_admin_user_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник пошуку користувачів адміністратором"""
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    
+    try:
+        # Шукаємо користувачів
+        results = access_manager.search_users(message_text)
+        
+        if not results:
+            await update.message.reply_text(
+                f"🔍 **Результати пошуку**\n\n"
+                f"❌ Користувачів не знайдено за запитом: '{message_text}'\n\n"
+                f"Спробуйте інший запит:",
+                reply_markup=get_admin_users_keyboard()
+            )
+            return
+        
+        # Форматуємо результати
+        results_text = f"🔍 **Результати пошуку** (знайдено: {len(results)})\n\n"
+        
+        for i, result in enumerate(results[:10], 1):  # Показуємо перших 10
+            role_emoji = "👑" if result.get('role') == 'admin' else "👤"
+            status_emoji = "✅" if result.get('is_active', True) else "❌"
+            match_type = "username" if result.get('match_type') == 'username' else "Telegram ID"
+            
+            results_text += (
+                f"{i}. {role_emoji} **{result.get('username', 'Без імені')}**\n"
+                f"   🆔 ID: `{result.get('telegram_id')}`\n"
+                f"   📊 Статус: {status_emoji}\n"
+                f"   🔍 Знайдено за: {match_type}\n"
+                f"   📅 Створено: {result.get('created_at', '')[:10]}\n\n"
+            )
+        
+        if len(results) > 10:
+            results_text += f"... та ще {len(results) - 10} результатів"
+        
+        await update.message.reply_text(
+            results_text,
+            reply_markup=get_admin_users_keyboard(),
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **Помилка пошуку:** {str(e)}",
+            reply_markup=get_admin_users_keyboard()
+        )
+    finally:
+        # Очищаємо стан
+        if user_id in user_states:
+            del user_states[user_id]
+
+async def handle_admin_user_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник видалення користувачів адміністратором"""
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    
+    try:
+        # Перевіряємо чи це число
+        if not message_text.isdigit():
+            await update.message.reply_text(
+                "❌ **Неправильний формат!**\n\n"
+                "Telegram ID повинен бути числом.\n"
+                "Введіть Telegram ID ще раз:"
+            )
+            return
+        
+        target_telegram_id = int(message_text)
+        
+        # Перевіряємо чи користувач існує
+        target_user = access_manager.get_user_by_telegram_id(target_telegram_id)
+        if not target_user:
+            await update.message.reply_text(
+                f"❌ **Користувач не знайдений!**\n\n"
+                f"Користувач з Telegram ID {target_telegram_id} не існує в системі.\n\n"
+                f"Введіть інший Telegram ID:"
+            )
+            return
+        
+        # Перевіряємо чи не намагаємося видалити себе
+        if target_telegram_id == user_id:
+            await update.message.reply_text(
+                "❌ **Неможливо видалити себе!**\n\n"
+                "Ви не можете видалити власний акаунт.\n\n"
+                "Введіть інший Telegram ID:"
+            )
+            return
+        
+        # Видаляємо користувача
+        if access_manager.delete_user(target_telegram_id):
+            username = target_user.get('username', 'Без імені')
+            role = target_user.get('role', 'user')
+            
+            await update.message.reply_text(
+                f"🗑️ **Користувач успішно видалений!**\n\n"
+                f"👤 **Username:** {username}\n"
+                f"🆔 **Telegram ID:** {target_telegram_id}\n"
+                f"👑 **Роль:** {'Адміністратор' if role == 'admin' else 'Користувач'}\n\n"
+                f"Користувач повністю видалений з системи.",
+                reply_markup=get_admin_users_keyboard(),
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ **Помилка видалення користувача!**\n\n"
+                "Спробуйте ще раз.",
+                reply_markup=get_admin_users_keyboard()
+            )
+        
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **Помилка:** {str(e)}",
+            reply_markup=get_admin_users_keyboard()
+        )
+    finally:
+        # Очищаємо стан
+        if user_id in user_states:
+            del user_states[user_id]
+
+async def handle_admin_role_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник зміни ролі користувача адміністратором"""
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    state_data = user_states[user_id]['data']
+    
+    try:
+        if state_data['step'] == 'telegram_id':
+            # Перевіряємо чи це число
+            if not message_text.isdigit():
+                await update.message.reply_text(
+                    "❌ **Неправильний формат!**\n\n"
+                    "Telegram ID повинен бути числом.\n"
+                    "Введіть Telegram ID ще раз:"
+                )
+                return
+            
+            target_telegram_id = int(message_text)
+            
+            # Перевіряємо чи користувач існує
+            target_user = access_manager.get_user_by_telegram_id(target_telegram_id)
+            if not target_user:
+                await update.message.reply_text(
+                    f"❌ **Користувач не знайдений!**\n\n"
+                    f"Користувач з Telegram ID {target_telegram_id} не існує в системі.\n\n"
+                    f"Введіть інший Telegram ID:"
+                )
+                return
+            
+            # Зберігаємо дані та переходимо до вибору ролі
+            state_data['target_telegram_id'] = target_telegram_id
+            state_data['target_user'] = target_user
+            state_data['step'] = 'new_role'
+            
+            current_role = target_user.get('role', 'user')
+            current_role_text = "Адміністратор" if current_role == "admin" else "Користувач"
+            
+            await update.message.reply_text(
+                f"✅ **Користувач знайдений:**\n\n"
+                f"👤 **Username:** {target_user.get('username', 'Без імені')}\n"
+                f"🆔 **Telegram ID:** {target_telegram_id}\n"
+                f"👑 **Поточна роль:** {current_role_text}\n\n"
+                f"🔄 **Виберіть нову роль:**\n\n"
+                f"Введіть: 'admin' або 'user'",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")
+                ]])
+            )
+            
+        elif state_data['step'] == 'new_role':
+            new_role = message_text.lower().strip()
+            
+            if new_role not in ['admin', 'user']:
+                await update.message.reply_text(
+                    "❌ **Невірна роль!**\n\n"
+                    "Доступні ролі: 'admin' або 'user'\n"
+                    "Введіть роль ще раз:"
+                )
+                return
+            
+            target_telegram_id = state_data['target_telegram_id']
+            target_user = state_data['target_user']
+            
+            # Змінюємо роль
+            if access_manager.change_user_role(target_telegram_id, new_role):
+                old_role_text = "Адміністратор" if target_user.get('role') == 'admin' else "Користувач"
+                new_role_text = "Адміністратор" if new_role == 'admin' else "Користувач"
+                
+                await update.message.reply_text(
+                    f"🔄 **Роль успішно змінена!**\n\n"
+                    f"👤 **Username:** {target_user.get('username', 'Без імені')}\n"
+                    f"🆔 **Telegram ID:** {target_telegram_id}\n"
+                    f"👑 **Стара роль:** {old_role_text}\n"
+                    f"👑 **Нова роль:** {new_role_text}\n\n"
+                    f"Дозволи користувача оновлено автоматично.",
+                    reply_markup=get_admin_users_keyboard(),
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ **Помилка зміни ролі!**\n\n"
+                    "Спробуйте ще раз.",
+                    reply_markup=get_admin_users_keyboard()
+                )
+            
+            # Очищаємо стан
+            del user_states[user_id]
+            
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **Помилка:** {str(e)}",
+            reply_markup=get_admin_users_keyboard()
+        )
+        # Очищаємо стан при помилці
+        if user_id in user_states:
+            del user_states[user_id]
+
+async def handle_admin_password_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник скидання паролю користувача адміністратором"""
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    state_data = user_states[user_id]['data']
+    
+    try:
+        if state_data['step'] == 'telegram_id':
+            # Перевіряємо чи це число
+            if not message_text.isdigit():
+                await update.message.reply_text(
+                    "❌ **Неправильний формат!**\n\n"
+                    "Telegram ID повинен бути числом.\n"
+                    "Введіть Telegram ID ще раз:"
+                )
+                return
+            
+            target_telegram_id = int(message_text)
+            
+            # Перевіряємо чи користувач існує
+            target_user = access_manager.get_user_by_telegram_id(target_telegram_id)
+            if not target_user:
+                await update.message.reply_text(
+                    f"❌ **Користувач не знайдений!**\n\n"
+                    f"Користувач з Telegram ID {target_telegram_id} не існує в системі.\n\n"
+                    f"Введіть інший Telegram ID:"
+                )
+                return
+            
+            # Зберігаємо дані та переходимо до введення паролю
+            state_data['target_telegram_id'] = target_telegram_id
+            state_data['target_user'] = target_user
+            state_data['step'] = 'new_password'
+            
+            await update.message.reply_text(
+                f"✅ **Користувач знайдений:**\n\n"
+                f"👤 **Username:** {target_user.get('username', 'Без імені')}\n"
+                f"🆔 **Telegram ID:** {target_telegram_id}\n\n"
+                f"🔐 **Введіть новий пароль:**\n\n"
+                f"💡 **Примітка:** Якщо залишити порожнім, буде використано пароль за замовчуванням",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")
+                ]])
+            )
+            
+        elif state_data['step'] == 'new_password':
+            new_password = message_text.strip()
+            target_telegram_id = state_data['target_telegram_id']
+            target_user = state_data['target_user']
+            
+            # Скидаємо пароль
+            if access_manager.reset_user_password(target_telegram_id, new_password if new_password else None):
+                password_text = new_password if new_password else "за замовчуванням"
+                
+                await update.message.reply_text(
+                    f"🔐 **Пароль успішно скинуто!**\n\n"
+                    f"👤 **Username:** {target_user.get('username', 'Без імені')}\n"
+                    f"🆔 **Telegram ID:** {target_telegram_id}\n"
+                    f"🔐 **Новий пароль:** {password_text}\n\n"
+                    f"Користувач буде розлогінений з усіх пристроїв.",
+                    reply_markup=get_admin_users_keyboard(),
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ **Помилка скидання паролю!**\n\n"
+                    "Спробуйте ще раз.",
+                    reply_markup=get_admin_users_keyboard()
+                )
+            
+            # Очищаємо стан
+            del user_states[user_id]
+            
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **Помилка:** {str(e)}",
+            reply_markup=get_admin_users_keyboard()
+        )
+        # Очищаємо стан при помилці
+        if user_id in user_states:
+            del user_states[user_id]
+
+async def handle_admin_system_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник скидання системи адміністратором"""
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    
+    try:
+        if message_text == "CONFIRM_RESET":
+            # Підтверджуємо скидання системи
+            if access_manager.reset_system():
+                await update.message.reply_text(
+                    f"⚠️ **СИСТЕМА СКИНУТА!**\n\n"
+                    f"✅ **Виконано:**\n"
+                    f"• Всіх користувачів видалено\n"
+                    f"• Всі проекти видалено\n"
+                    f"• Всі сесії очищено\n"
+                    f"• Резервна копія створена\n\n"
+                    f"👑 **Збережено:**\n"
+                    f"• Всіх адміністраторів\n"
+                    f"• Системні налаштування\n\n"
+                    f"Система готова до нового використання.",
+                    reply_markup=get_admin_system_keyboard(),
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ **Помилка скидання системи!**\n\n"
+                    "Спробуйте ще раз.",
+                    reply_markup=get_admin_system_keyboard()
+                )
+        else:
+            await update.message.reply_text(
+                "❌ **Неправильне підтвердження!**\n\n"
+                "Для підтвердження скидання системи введіть точно: **CONFIRM_RESET**\n\n"
+                "⚠️ **УВАГА!** Ця дія незворотна!",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Скасувати", callback_data="admin_system")
+                ]])
+            )
+            return
+        
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **Помилка:** {str(e)}",
+            reply_markup=get_admin_system_keyboard()
+        )
+    finally:
+        # Очищаємо стан
+        if user_id in user_states:
+            del user_states[user_id]
+
+async def handle_admin_forward_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробник вибору користувача для керування пересиланням"""
+    admin_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    try:
+        if not message_text.isdigit():
+            await update.message.reply_text("❌ Введіть числовий Telegram ID користувача:")
+            return
+        target_id = int(message_text)
+        target_user = access_manager.get_user_by_telegram_id(target_id)
+        if not target_user:
+            await update.message.reply_text("❌ Користувача не знайдено. Введіть інший Telegram ID:")
+            return
+        # Зберігаємо і показуємо меню керування пересиланням
+        user_states[admin_id] = {'state': 'admin_forward_set_user_menu', 'data': {'target_id': target_id}}
+        status = project_manager.get_forward_status(target_id)
+        enabled = status.get('enabled', False)
+        channel = status.get('channel_id') or '—'
+        await update.message.reply_text(
+            f"🔁 Пересилання для користувача `{target_id}`\n\nСтатус: {'🟢 увімкнено' if enabled else '🔴 вимкнено'}\nКанал: `{channel}`",
+            reply_markup=get_admin_forward_keyboard(target_id),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Помилка: {e}")
+
+async def handle_admin_forward_set_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Адмін встановлює канал для вибраного користувача"""
+    admin_id = update.effective_user.id
+    message_text = update.message.text.strip()
+    state = user_states.get(admin_id, {}).get('data', {})
+    target_id = state.get('target_id')
+    if not target_id:
+        await update.message.reply_text("❌ Сесія втрачена. Поверніться в адмін-меню.")
+        return
+    # Підтримуємо 2 способи: текстовий ID або переслане повідомлення з каналу
+    fwd_chat = getattr(update.message, 'forward_from_chat', None)
+    if fwd_chat:
+        channel_id_str = str(getattr(fwd_chat, 'id', ''))
+    else:
+        if not message_text:
+            await update.message.reply_text("❌ Введіть ID каналу або перешліть повідомлення з нього.")
+            return
+        channel_id_str = message_text
+    if project_manager.set_forward_channel(target_id, channel_id_str):
+        await update.message.reply_text(
+            f"✅ Канал збережено для `{target_id}`: `{normalize_chat_id(channel_id_str)}`",
+            parse_mode='Markdown',
+            reply_markup=get_admin_forward_keyboard(target_id)
+        )
+    else:
+        await update.message.reply_text("❌ Не вдалося зберегти канал.")
+
 async def handle_selenium_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник додавання Selenium Twitter акаунта"""
     user_id = update.effective_user.id
@@ -1458,8 +3117,8 @@ async def handle_channel_ping(update: Update, context: ContextTypes.DEFAULT_TYPE
             user_id = update.message.from_user.id
             username = update.message.from_user.username or update.message.from_user.first_name
             
-            # Перевіряємо чи користувач авторизований
-            if not security_manager.is_user_authorized(user_id):
+            # Перевіряємо чи користувач авторизований (узгоджено з іншими перевірками)
+            if not access_manager.is_authorized(user_id):
                 # Відправляємо повідомлення в особисті повідомлення
                 try:
                     await context.bot.send_message(
@@ -1485,7 +3144,7 @@ async def handle_channel_ping(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 
                 await context.bot.send_message(
-                    chat_id=channel_id,
+                    chat_id=normalize_chat_id(str(channel_id)),
                     text=confirmation_text,
                     parse_mode='Markdown'
                 )
@@ -1493,7 +3152,7 @@ async def handle_channel_ping(update: Update, context: ContextTypes.DEFAULT_TYPE
                 # Відправляємо повідомлення в особисті повідомлення
                 try:
                     await context.bot.send_message(
-                        chat_id=user_id,
+                        chat_id=normalize_chat_id(str(user_id)),
                         text=f"✅ Канал '{channel_title}' успішно налаштовано для пересилання сповіщень!"
                     )
                 except:
@@ -1532,7 +3191,7 @@ async def handle_discord_history(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     
     if user_id not in user_states or user_states[user_id]['state'] != 'viewing_history':
-        await query.edit_message_text("❌ Помилка: стан сесії втрачено.", reply_markup=get_main_menu_keyboard())
+        await query.edit_message_text("❌ Помилка: стан сесії втрачено.", reply_markup=get_main_menu_keyboard(user_id))
         return
     
     project = user_states[user_id]['data']['project']
@@ -1547,7 +3206,7 @@ async def handle_discord_history(update: Update, context: ContextTypes.DEFAULT_T
         if not messages:
             await query.edit_message_text(
                 f"📜 Історія каналу: {project['name']}\n\n❌ Не вдалося отримати повідомлення.\nМожливо, немає доступу до каналу або канал порожній.",
-                reply_markup=get_main_menu_keyboard()
+                reply_markup=get_main_menu_keyboard(user_id)
             )
         else:
             # Форматуємо повідомлення
@@ -1563,13 +3222,13 @@ async def handle_discord_history(update: Update, context: ContextTypes.DEFAULT_T
                     else:
                         await context.bot.send_message(chat_id=user_id, text=part)
             else:
-                await query.edit_message_text(history_text, reply_markup=get_main_menu_keyboard())
+                await query.edit_message_text(history_text, reply_markup=get_main_menu_keyboard(user_id))
                 
     except Exception as e:
         logger.error(f"Помилка отримання історії Discord: {e}")
         await query.edit_message_text(
             f"❌ Помилка при отриманні історії каналу {project['name']}:\n{str(e)}",
-            reply_markup=get_main_menu_keyboard()
+            reply_markup=get_main_menu_keyboard(user_id)
         )
     finally:
         # Очищуємо стан користувача
@@ -1657,19 +3316,10 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
         return
         
     try:
-        # Отримуємо всіх користувачів з налаштованими каналами пересилання
-        # (не залежить від авторизації)
-        all_users = project_manager.get_all_users()
-        users_with_forwarding = []
+        # Кеші для оптимізації
+        channel_to_tracked_users: Dict[str, List[int]] = {}
+        user_to_forward_channel: Dict[int, str] = {}
         
-        for user_id in all_users:
-            forward_channel = project_manager.get_forward_channel(user_id)
-            if forward_channel:
-                users_with_forwarding.append(user_id)
-        
-        if not users_with_forwarding:
-            return
-                
         # Швидка обробка повідомлень
         for message in new_messages:
             message_id = message.get('message_id', '')
@@ -1724,11 +3374,37 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
             if images:
                 forward_text += f"\n📷 Зображень: {len(images)}"
             
+            # Отримуємо всіх користувачів, які відстежують цей Discord канал
+            if channel_id in channel_to_tracked_users:
+                tracked_users = channel_to_tracked_users[channel_id]
+            else:
+                tracked_users = get_users_tracking_discord_channel(channel_id)
+                channel_to_tracked_users[channel_id] = tracked_users
+
+            # Фільтруємо тільки користувачів з налаштованим пересиланням
+            users_with_forwarding: List[int] = []
+            for user_id in tracked_users:
+                if user_id in user_to_forward_channel:
+                    forward_channel = user_to_forward_channel[user_id]
+                else:
+                    forward_channel = project_manager.get_forward_channel(user_id)
+                    user_to_forward_channel[user_id] = forward_channel
+                if forward_channel:
+                    users_with_forwarding.append(user_id)
+            if not users_with_forwarding:
+                continue
+
+            # Не дублювати відправку, якщо кілька користувачів вказали той самий цільовий канал
+            sent_targets: Set[str] = set()
+
             for user_id in users_with_forwarding:
                 try:
                     # Швидка перевірка каналу
-                    forward_channel = project_manager.get_forward_channel(user_id)
+                    forward_channel = user_to_forward_channel.get(user_id) or project_manager.get_forward_channel(user_id)
                     if not forward_channel:
+                        continue
+                    if forward_channel in sent_targets:
+                        # Уже відправлено в цей канал цю подію
                         continue
                     
                     # Швидка перевірка дублікатів
@@ -1739,7 +3415,7 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                     # Відправляємо текст повідомлення
                     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
                     data = {
-                        'chat_id': forward_channel,
+                        'chat_id': normalize_chat_id(forward_channel),
                         'text': forward_text,
                         'parse_mode': 'Markdown'
                     }
@@ -1759,6 +3435,7 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                                     logger.error(f"Помилка відправки Discord зображення: {e}")
                         
                         project_manager.add_sent_message(forward_key, forward_channel, user_id)
+                        sent_targets.add(forward_channel)
                         logger.info(f"✅ Переслано в канал {forward_channel} (користувач {user_id})")
                     else:
                         logger.error(f"❌ Помилка відправки в канал {forward_channel}: {response.status_code}")
@@ -1771,28 +3448,42 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
 
 def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
     """Обробник нових твітів Twitter (оптимізована версія)"""
-    global bot_instance
+    global bot_instance, global_sent_tweets
     
     if not bot_instance:
         return
         
     try:
-        # Отримуємо всіх користувачів з налаштованими каналами пересилання
-        all_users = project_manager.get_all_users()
-        users_with_forwarding = []
-        
-        for user_id in all_users:
-            forward_channel = project_manager.get_forward_channel(user_id)
-            if forward_channel:
-                users_with_forwarding.append(user_id)
-        
-        if not users_with_forwarding:
-            return
-                
         # Швидка обробка твітів
         for tweet in new_tweets:
             tweet_id = tweet.get('tweet_id', '')
             account = tweet.get('account', '')
+            
+            # Отримуємо всіх користувачів, які відстежують цей Twitter акаунт, та мають ввімкнене пересилання
+            users_with_forwarding: List[int] = []
+            tracked_users = get_users_tracking_twitter(account)
+            for user_id in tracked_users:
+                forward_channel = project_manager.get_forward_channel(user_id)
+                if forward_channel:
+                    users_with_forwarding.append(user_id)
+            if not users_with_forwarding:
+                continue
+
+            # Глобальна перевірка дублікатів
+            if account not in global_sent_tweets:
+                global_sent_tweets[account] = set()
+            
+            # Перевіряємо чи цей твіт вже був відправлений глобально
+            if tweet_id in global_sent_tweets[account]:
+                logger.info(f"Твіт {tweet_id} для {account} вже був відправлений, пропускаємо")
+                continue
+            
+            # Додаємо твіт до глобально відправлених
+            global_sent_tweets[account].add(tweet_id)
+            
+            # Періодично очищуємо старі твіти
+            if len(global_sent_tweets[account]) % 50 == 0:  # Кожні 50 твітів
+                cleanup_old_tweets()
             
             # Красиве форматування
             author = escape_markdown(tweet.get('author', 'Unknown'))
@@ -1847,7 +3538,7 @@ def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
                     # Відправляємо текст повідомлення
                     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
                     data = {
-                        'chat_id': forward_channel,
+                        'chat_id': normalize_chat_id(forward_channel),
                         'text': forward_text,
                         'parse_mode': 'Markdown'
                     }
@@ -2195,6 +3886,8 @@ async def selenium_start_command(update: Update, context: ContextTypes.DEFAULT_T
     selenium_thread = threading.Thread(target=lambda: asyncio.run(start_selenium_twitter_monitoring()))
     selenium_thread.daemon = True
     selenium_thread.start()
+    # Старт після синхронізації — на всяк випадок
+    sync_monitors_with_projects()
     
     await update.message.reply_text("🚀 **Selenium Twitter моніторинг запущено!**\n\nБот буде перевіряти нові твіти кожні 30 секунд.", parse_mode='Markdown')
 
@@ -2300,13 +3993,21 @@ async def remove_twitter_command(update: Update, context: ContextTypes.DEFAULT_T
     if project_manager.remove_project(user_id, project_to_remove['id']):
         await update.message.reply_text(f"✅ Twitter акаунт @{username} видалено з моніторингу.")
         
-        # Також видаляємо з Selenium монітора якщо він активний
+        # Також видаляємо з активних моніторів
         global selenium_twitter_monitor
         if selenium_twitter_monitor and username in selenium_twitter_monitor.monitoring_accounts:
             selenium_twitter_monitor.monitoring_accounts.discard(username)
             if username in selenium_twitter_monitor.seen_tweets:
                 del selenium_twitter_monitor.seen_tweets[username]
             await update.message.reply_text(f"✅ Акаунт @{username} також видалено з Selenium моніторингу.")
+        global twitter_monitor
+        try:
+            if twitter_monitor:
+                twitter_monitor.remove_account(username)
+        except Exception:
+            pass
+        # Після змін — синхронізуємо стан усіх моніторів
+        sync_monitors_with_projects()
     else:
         await update.message.reply_text(f"❌ Помилка видалення Twitter акаунта @{username}.")
 
@@ -2375,6 +4076,8 @@ async def remove_discord_command(update: Update, context: ContextTypes.DEFAULT_T
             if channel_id in discord_monitor.last_message_ids:
                 del discord_monitor.last_message_ids[channel_id]
             await update.message.reply_text(f"✅ Канал {channel_id} також видалено з Discord моніторингу.")
+        # Після змін — синхронізуємо стан
+        sync_monitors_with_projects()
     else:
         await update.message.reply_text(f"❌ Помилка видалення Discord каналу {channel_id}.")
 
@@ -2389,6 +4092,174 @@ def extract_discord_channel_id(url: str) -> str:
     import re
     match = re.search(r'discord\.com/channels/\d+/(\d+)', url)
     return match.group(1) if match else url
+
+async def admin_create_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для створення нового користувача (тільки для адміністратора)"""
+    user_id = update.effective_user.id
+    
+    # Перевіряємо чи користувач є адміністратором
+    if not access_manager.is_admin(user_id):
+        await update.message.reply_text(
+            "❌ **Доступ заборонено!**\n\n"
+            "Тільки адміністратор може створювати нових користувачів.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "📝 **Створення нового користувача**\n\n"
+            "Використання: /admin_create_user <telegram_id> <username> [password]\n\n"
+            "Приклад: /admin_create_user 123456789 JohnDoe mypassword",
+            parse_mode='Markdown'
+        )
+        return
+    
+    try:
+        telegram_id = int(context.args[0])
+        username = context.args[1]
+        password = context.args[2] if len(context.args) > 2 else None
+        
+        # Створюємо користувача
+        user_id_created = access_manager.add_user(telegram_id, username, password)
+        
+        if user_id_created:
+            await update.message.reply_text(
+                f"✅ **Користувач успішно створений!**\n\n"
+                f"👤 **Username:** {username}\n"
+                f"🆔 **Telegram ID:** {telegram_id}\n"
+                f"🔐 **Пароль:** {password or 'за замовчуванням'}\n"
+                f"👑 **Роль:** Користувач\n\n"
+                f"Користувач може увійти в систему командою /login",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Помилка створення користувача (можливо, користувач вже існує).",
+                parse_mode='Markdown'
+            )
+            
+    except ValueError:
+        await update.message.reply_text(
+            "❌ **Неправильний формат!**\n\n"
+            "Telegram ID повинен бути числом.\n"
+            "Приклад: /admin_create_user 123456789 JohnDoe",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Помилка створення користувача: {str(e)}",
+            parse_mode='Markdown'
+        )
+
+async def admin_create_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для створення нового адміністратора (тільки для адміністратора)"""
+    user_id = update.effective_user.id
+    
+    # Перевіряємо чи користувач є адміністратором
+    if not access_manager.is_admin(user_id):
+        await update.message.reply_text(
+            "❌ **Доступ заборонено!**\n\n"
+            "Тільки адміністратор може створювати інших адміністраторів.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "📝 **Створення нового адміністратора**\n\n"
+            "Використання: /admin_create_admin <telegram_id> <username> [password]\n\n"
+            "Приклад: /admin_create_admin 123456789 AdminJohn adminpass123",
+            parse_mode='Markdown'
+        )
+        return
+    
+    try:
+        telegram_id = int(context.args[0])
+        username = context.args[1]
+        password = context.args[2] if len(context.args) > 2 else None
+        
+        # Створюємо адміністратора
+        user_id_created = access_manager.create_admin_user(telegram_id, username, password)
+        
+        if user_id_created:
+            await update.message.reply_text(
+                f"✅ **Адміністратор успішно створений!**\n\n"
+                f"👤 **Username:** {username}\n"
+                f"🆔 **Telegram ID:** {telegram_id}\n"
+                f"🔐 **Пароль:** {password or 'за замовчуванням'}\n"
+                f"👑 **Роль:** Адміністратор\n\n"
+                f"Адміністратор може увійти в систему командою /login",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Помилка створення адміністратора (можливо, користувач вже існує).",
+                parse_mode='Markdown'
+            )
+            
+    except ValueError:
+        await update.message.reply_text(
+            "❌ **Неправильний формат!**\n\n"
+            "Telegram ID повинен бути числом.\n"
+            "Приклад: /admin_create_admin 123456789 AdminJohn",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Помилка створення адміністратора: {str(e)}",
+            parse_mode='Markdown'
+        )
+
+async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для перегляду всіх користувачів (тільки для адміністратора)"""
+    user_id = update.effective_user.id
+    
+    # Перевіряємо чи користувач є адміністратором
+    if not access_manager.is_admin(user_id):
+        await update.message.reply_text(
+            "❌ **Доступ заборонено!**\n\n"
+            "Тільки адміністратор може переглядати список користувачів.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    try:
+        all_users = access_manager.get_all_users()
+        
+        if not all_users:
+            await update.message.reply_text(
+                "👥 **Список користувачів**\n\n"
+                "Користувачів не знайдено.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        users_text = "👥 **Список користувачів**\n\n"
+        
+        for i, user in enumerate(all_users[:20], 1):  # Показуємо перших 20
+            role_emoji = "👑" if user.get('role', 'user') == 'admin' else "👤"
+            status_emoji = "✅" if user.get('is_active', True) else "❌"
+            
+            users_text += (
+                f"{i}. {role_emoji} **{user.get('username', 'Без імені')}**\n"
+                f"   🆔 ID: `{user.get('telegram_id')}`\n"
+                f"   📊 Статус: {status_emoji}\n"
+                f"   📅 Створено: {user.get('created_at', '')[:10]}\n\n"
+            )
+        
+        if len(all_users) > 20:
+            users_text += f"... та ще {len(all_users) - 20} користувачів\n\n"
+        
+        users_text += f"**Всього користувачів:** {len(all_users)}"
+        
+        await update.message.reply_text(users_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ **Помилка отримання списку користувачів**\n\n{str(e)}",
+            parse_mode='Markdown'
+        )
 
 def main() -> None:
     """Головна функція"""
@@ -2428,6 +4299,18 @@ def main() -> None:
     application.add_handler(CommandHandler("accounts", accounts_command))
     application.add_handler(CommandHandler("remove_twitter", remove_twitter_command))
     application.add_handler(CommandHandler("remove_discord", remove_discord_command))
+    
+    # Пересилання (персональні налаштування)
+    application.add_handler(CommandHandler("forward_on", forward_enable_command))
+    application.add_handler(CommandHandler("forward_off", forward_disable_command))
+    application.add_handler(CommandHandler("forward_status", forward_status_command))
+    application.add_handler(CommandHandler("forward_set_channel", forward_set_channel_command))
+    application.add_handler(CommandHandler("forward_test", forward_test_command))
+    
+    # Адміністративні команди
+    application.add_handler(CommandHandler("admin_create_user", admin_create_user_command))
+    application.add_handler(CommandHandler("admin_create_admin", admin_create_admin_command))
+    application.add_handler(CommandHandler("admin_users", admin_users_command))
     
     application.add_error_handler(error_handler)
     
@@ -2473,6 +4356,9 @@ def main() -> None:
     else:
         logger.info("ℹ️ Збережених Selenium акаунтів не знайдено - моніторинг буде запущено без акаунтів")
     
+    # На старті проводимо синхронізацію моніторів з проектами/базою
+    sync_monitors_with_projects()
+
     # Запускаємо Selenium моніторинг в окремому потоці
     selenium_thread = threading.Thread(target=lambda: asyncio.run(start_selenium_twitter_monitoring()))
     selenium_thread.daemon = True

@@ -3,6 +3,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
+from access_manager import access_manager
 
 class ProjectManager:
     def __init__(self, data_file: str = "data.json"):
@@ -61,9 +62,16 @@ class ProjectManager:
         except Exception as e:
             self.logger.error(f"Помилка збереження даних: {e}")
             
-    def add_project(self, user_id: int, project_data: Dict) -> bool:
+    def add_project(self, user_id: int, project_data: Dict, target_user_id: int = None) -> bool:
         """Додати новий проект"""
         try:
+            # Якщо вказано target_user_id, перевіряємо права адміністратора
+            if target_user_id and target_user_id != user_id:
+                if not access_manager.check_permission(user_id, "can_create_projects_for_others"):
+                    self.logger.warning(f"Користувач {user_id} намагається створити проект для {target_user_id} без дозволу")
+                    return False
+                user_id = target_user_id
+            
             user_id_str = str(user_id)
             if user_id_str not in self.data['projects']:
                 self.data['projects'][user_id_str] = []
@@ -71,6 +79,7 @@ class ProjectManager:
             # Додаємо ID проекту та час створення
             project_data['id'] = len(self.data['projects'][user_id_str]) + 1
             project_data['created_at'] = datetime.now().isoformat()
+            project_data['created_by'] = user_id  # Хто створив проект
             
             self.data['projects'][user_id_str].append(project_data)
             self.save_data()
@@ -485,3 +494,109 @@ class ProjectManager:
         except Exception as e:
             self.logger.error(f"Помилка отримання інформації про Selenium акаунт {username}: {e}")
             return None
+    
+    # Методи для адміністраторів
+    
+    def get_all_projects(self, admin_user_id: int) -> Dict[int, List[Dict]]:
+        """Отримати всі проекти всіх користувачів (тільки для адміністраторів)"""
+        try:
+            if not access_manager.check_permission(admin_user_id, "can_manage_all_projects"):
+                self.logger.warning(f"Користувач {admin_user_id} намагається отримати всі проекти без дозволу")
+                return {}
+            
+            return self.data['projects']
+            
+        except Exception as e:
+            self.logger.error(f"Помилка отримання всіх проектів: {e}")
+            return {}
+    
+    def get_user_projects_for_admin(self, admin_user_id: int, target_user_id: int) -> List[Dict]:
+        """Отримати проекти користувача для адміністратора"""
+        try:
+            if not access_manager.check_permission(admin_user_id, "can_manage_all_projects"):
+                self.logger.warning(f"Користувач {admin_user_id} намагається переглянути проекти користувача {target_user_id} без дозволу")
+                return []
+            
+            return self.get_user_projects(target_user_id)
+            
+        except Exception as e:
+            self.logger.error(f"Помилка отримання проектів користувача {target_user_id}: {e}")
+            return []
+    
+    def delete_user_project_as_admin(self, admin_user_id: int, target_user_id: int, project_id: int) -> bool:
+        """Видалити проект користувача як адміністратор"""
+        try:
+            if not access_manager.check_permission(admin_user_id, "can_manage_all_projects"):
+                self.logger.warning(f"Користувач {admin_user_id} намагається видалити проект користувача {target_user_id} без дозволу")
+                return False
+            
+            return self.delete_project(target_user_id, project_id)
+            
+        except Exception as e:
+            self.logger.error(f"Помилка видалення проекту користувача {target_user_id}: {e}")
+            return False
+    
+    def get_all_users_with_projects(self, admin_user_id: int) -> List[Dict]:
+        """Отримати список всіх користувачів з їх проектами (тільки для адміністраторів)"""
+        try:
+            if not access_manager.check_permission(admin_user_id, "can_manage_all_projects"):
+                self.logger.warning(f"Користувач {admin_user_id} намагається отримати список користувачів без дозволу")
+                return []
+            
+            users_with_projects = []
+            for user_id_str, projects in self.data['projects'].items():
+                user_id = int(user_id_str)
+                user_data = access_manager.get_user_by_telegram_id(user_id)
+                
+                if user_data:
+                    user_info = {
+                        'user_id': user_id,
+                        'username': user_data.get('username', ''),
+                        'role': user_data.get('role', 'user'),
+                        'is_active': user_data.get('is_active', True),
+                        'projects_count': len(projects),
+                        'last_login': user_data.get('last_login'),
+                        'created_at': user_data.get('created_at')
+                    }
+                    users_with_projects.append(user_info)
+            
+            return users_with_projects
+            
+        except Exception as e:
+            self.logger.error(f"Помилка отримання користувачів з проектами: {e}")
+            return []
+    
+    def get_project_statistics(self, admin_user_id: int) -> Dict:
+        """Отримати статистику проектів (тільки для адміністраторів)"""
+        try:
+            if not access_manager.check_permission(admin_user_id, "can_manage_all_projects"):
+                self.logger.warning(f"Користувач {admin_user_id} намагається отримати статистику без дозволу")
+                return {}
+            
+            stats = {
+                'total_users': len(self.data['projects']),
+                'total_projects': sum(len(projects) for projects in self.data['projects'].values()),
+                'twitter_projects': 0,
+                'discord_projects': 0,
+                'selenium_accounts': len(self.data.get('selenium_accounts', {})),
+                'active_users': 0
+            }
+            
+            for user_id_str, projects in self.data['projects'].items():
+                user_id = int(user_id_str)
+                user_data = access_manager.get_user_by_telegram_id(user_id)
+                
+                if user_data and user_data.get('is_active', True):
+                    stats['active_users'] += 1
+                
+                for project in projects:
+                    if project.get('platform') == 'twitter':
+                        stats['twitter_projects'] += 1
+                    elif project.get('platform') == 'discord':
+                        stats['discord_projects'] += 1
+            
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"Помилка отримання статистики: {e}")
+            return {}

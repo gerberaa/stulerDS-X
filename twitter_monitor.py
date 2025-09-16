@@ -17,6 +17,7 @@ class TwitterMonitor:
         self.session = None
         self.monitoring_accounts = set()
         self.last_tweet_ids = {}  # account -> last_tweet_id
+        self.sent_tweets = {}  # account -> set of sent tweet_ids
         self.logger = logging.getLogger(__name__)
         
     async def __aenter__(self):
@@ -60,6 +61,9 @@ class TwitterMonitor:
             clean_username = username.replace('@', '').strip()
             if clean_username:
                 self.monitoring_accounts.add(clean_username)
+                # Ініціалізуємо множину відправлених твітів для нового акаунта
+                if clean_username not in self.sent_tweets:
+                    self.sent_tweets[clean_username] = set()
                 self.logger.info(f"Додано акаунт для моніторингу: {clean_username}")
                 return True
         except Exception as e:
@@ -74,6 +78,8 @@ class TwitterMonitor:
                 self.monitoring_accounts.remove(clean_username)
                 if clean_username in self.last_tweet_ids:
                     del self.last_tweet_ids[clean_username]
+                if clean_username in self.sent_tweets:
+                    del self.sent_tweets[clean_username]
                 self.logger.info(f"Видалено акаунт з моніторингу: {clean_username}")
                 return True
         except Exception as e:
@@ -487,6 +493,13 @@ class TwitterMonitor:
                         if isinstance(match, tuple) and len(match) > 1:
                             real_tweet_id = match[0]
                         
+                        # Генеруємо стабільний ID на основі тексту якщо немає реального ID
+                        if not real_tweet_id.startswith(('1', '2', '3', '4', '5', '6', '7', '8', '9')):
+                            # Створюємо хеш на основі тексту та часу для стабільності
+                            import hashlib
+                            text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:12]
+                            real_tweet_id = f"html_{text_hash}_{int(datetime.now().timestamp())}"
+                        
                         tweets.append({
                             'id': real_tweet_id,
                             'text': text,
@@ -517,9 +530,13 @@ class TwitterMonitor:
                     await asyncio.sleep(2)  # 2 секунди між акаунтами
                     
                 # Отримуємо твіти
-                tweets = await self.get_user_tweets(username, limit=3)
+                tweets = await self.get_user_tweets(username, limit=5)
                 if not tweets:
                     continue
+                
+                # Ініціалізуємо множину відправлених твітів якщо не існує
+                if username not in self.sent_tweets:
+                    self.sent_tweets[username] = set()
                     
                 # Знаходимо нові твіти
                 last_id = self.last_tweet_ids.get(username)
@@ -528,12 +545,19 @@ class TwitterMonitor:
                 if last_id is None:
                     if tweets:
                         self.last_tweet_ids[username] = tweets[0]['id']
+                        # Додаємо всі поточні твіти до відправлених (щоб не спамити при першому запуску)
+                        for tweet in tweets:
+                            self.sent_tweets[username].add(tweet['id'])
                     continue
                     
                 # Шукаємо нові твіти
                 found_new = False
                 for tweet in tweets:
                     tweet_id = tweet['id']
+                    
+                    # Перевіряємо чи цей твіт вже був відправлений
+                    if tweet_id in self.sent_tweets[username]:
+                        continue
                     
                     # Якщо знайшли останній відомий твіт - зупиняємося
                     if tweet_id == last_id:
@@ -550,6 +574,9 @@ class TwitterMonitor:
                         'timestamp': tweet.get('created_at', ''),
                         'url': tweet.get('url', f"https://twitter.com/{username}")
                     })
+                    
+                    # Додаємо твіт до відправлених
+                    self.sent_tweets[username].add(tweet_id)
                     
                 # Діагностичне логування
                 if found_new:

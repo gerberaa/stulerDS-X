@@ -33,6 +33,7 @@ class SeleniumTwitterMonitor:
         self.driver = None
         self.monitoring_accounts = set()
         self.seen_tweets = {}  # account -> set of tweet_ids
+        self.sent_tweets = {}  # account -> set of sent tweet_ids
         self.monitoring_active = False
         
         # Створюємо папку профілю якщо не існує
@@ -40,8 +41,8 @@ class SeleniumTwitterMonitor:
             os.makedirs(self.profile_path)
             logger.info(f"Створено папку профілю: {self.profile_path}")
         
-        # Автоматично ініціалізуємо драйвер
-        self._setup_driver(headless=True)
+        # Автоматично ініціалізуємо драйвер (у видимому режимі для простої авторизації)
+        self._setup_driver(headless=False)
         
     def _check_chrome_installation(self) -> bool:
         """Перевірити чи встановлений Chrome"""
@@ -107,9 +108,15 @@ class SeleniumTwitterMonitor:
             }
             chrome_options.add_experimental_option("prefs", prefs)
             
+            # Налаштування сумісності для Windows Server/без GPU
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--window-size=1280,900')
+            chrome_options.add_argument('--start-maximized')
+            # У разі відсутності GPU дозволяємо софт-рендер
+            chrome_options.add_argument('--enable-unsafe-swiftshader')
             # Режим без головки
             if headless:
-                chrome_options.add_argument('--headless')
+                chrome_options.add_argument('--headless=new')
             
             # Спробуємо використати автоматичний ChromeDriver
             try:
@@ -172,6 +179,8 @@ class SeleniumTwitterMonitor:
                 self.monitoring_accounts.add(clean_username)
                 if clean_username not in self.seen_tweets:
                     self.seen_tweets[clean_username] = set()
+                if clean_username not in self.sent_tweets:
+                    self.sent_tweets[clean_username] = set()
                 logger.info(f"Додано акаунт для моніторингу: {clean_username}")
                 return True
         except Exception as e:
@@ -379,6 +388,12 @@ class SeleniumTwitterMonitor:
             # Спробуємо знайти ID твіта
             tweet_id = f"selenium_{username}_{index}_{int(time.time())}"
             
+            # Генеруємо стабільний ID на основі тексту якщо немає реального ID
+            if text and len(text) > 10:
+                import hashlib
+                text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:12]
+                tweet_id = f"selenium_{text_hash}_{int(time.time())}"
+            
             # Спробуємо знайти посилання на твіт
             tweet_url = f"https://x.com/{username}"
             try:
@@ -552,13 +567,27 @@ class SeleniumTwitterMonitor:
         
         for username in self.monitoring_accounts:
             try:
+                # Ініціалізуємо множини якщо не існують
+                if username not in self.seen_tweets:
+                    self.seen_tweets[username] = set()
+                if username not in self.sent_tweets:
+                    self.sent_tweets[username] = set()
+                
                 tweets = await self.get_user_tweets(username, limit=5)
                 
                 for tweet in tweets:
                     tweet_id = tweet.get('id')
-                    if tweet_id and tweet_id not in self.seen_tweets[username]:
-                        new_tweets.append(tweet)
-                        self.seen_tweets[username].add(tweet_id)
+                    if tweet_id:
+                        # Перевіряємо чи цей твіт вже був відправлений
+                        if tweet_id in self.sent_tweets[username]:
+                            continue
+                            
+                        # Додаємо до нових твітів
+                        if tweet_id not in self.seen_tweets[username]:
+                            new_tweets.append(tweet)
+                            self.seen_tweets[username].add(tweet_id)
+                            self.sent_tweets[username].add(tweet_id)
+                            logger.info(f"Selenium: знайдено новий твіт {tweet_id} для {username}")
                         
             except Exception as e:
                 logger.error(f"Помилка перевірки твітів для {username}: {e}")
@@ -644,6 +673,20 @@ class SeleniumTwitterMonitor:
     
     def open_manual_auth(self):
         """Відкрити браузер для ручної авторизації"""
+        # Якщо драйвер відсутній або запущений у headless, переініціалізуємо видимий
+        if self.driver:
+            try:
+                # Перевіряємо, чи вікно видиме (у headless handle може бути відсутнім або ширина 0)
+                size = self.driver.get_window_size()
+                if not size or size.get('width', 0) == 0:
+                    raise Exception('Headless or invisible window detected')
+            except Exception:
+                # Закриваємо і створюємо видимий драйвер
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                self.driver = None
         if not self.driver:
             if not self._setup_driver(headless=False):
                 return False

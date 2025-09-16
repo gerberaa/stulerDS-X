@@ -1,0 +1,135 @@
+{
+  "users": {
+    "5a838e899cc3602a": {
+      "telegram_id": 7595525097,
+      "username": "Megymin",
+      "password_hash": "8fe9b0168e69aaf5dc0ddd49daa55a5ace90bd7c5ef9bcb547712e92e8c64875",
+      "created_at": "2025-09-16T00:35:27.527345",
+      "last_login": "2025-09-16T20:30:09.330311",
+      "login_attempts": 0,
+      "is_active": true,
+      "role": "admin",
+      "permissions": {
+        "can_monitor_twitter": true,
+        "can_monitor_discord": true,
+        "can_manage_users": true,
+        "can_view_logs": true,
+        "can_manage_all_projects": true,
+        "can_create_projects_for_others": true
+      }
+    },
+    "942c963fcba395df": {
+      "telegram_id": 455823539,
+      "username": "Vlad R",
+      "password_hash": "f967c921a9ce5b29d16ce4e605aa305d1293e5761ca15612595410115fa12716",
+      "created_at": "2025-09-16T17:58:22.831446",
+      "last_login": "2025-09-16T18:05:00.322078",
+      "login_attempts": 0,
+      "is_active": true,
+      "role": "user",
+      "permissions": {
+        "can_monitor_twitter": true,
+        "can_monitor_discord": true,
+        "can_manage_users": false,
+        "can_view_logs": false,
+        "can_manage_all_projects": false,
+        "can_create_projects_for_others": false
+      }
+    },
+    "acf70f4a9fc40f8f": {
+      "telegram_id": 1647155590,
+      "username": "Ultima thule",
+      "password_hash": "aa9901787ba79294a3fb4ada980adcd90c46dac39eb933c3729d52480c6fee8b",
+      "created_at": "2025-09-16T20:48:52.013991",
+      "last_login": null,
+      "login_attempts": 0,
+      "is_active": true,
+      "role": "user",
+      "permissions": {
+        "can_monitor_twitter": true,
+        "can_monitor_discord": true,
+        "can_manage_users": false,
+        "can_view_logs": false,
+        "can_manage_all_projects": false,
+        "can_create_projects_for_others": false
+      }
+    },
+    "d8b68cdfa7de17be": {
+      "telegram_id": 5480402133,
+      "username": "Oleg Goncharuk",
+      "password_hash": "ab7464063de4fbd2e443fdb64e1461b1d43c9d23aae0f77ec316b81d00d3f666",
+      "created_at": "2025-09-16T20:49:08.979984",
+      "last_login": null,
+      "login_attempts": 0,
+      "is_active": true,
+      "role": "user",
+      "permissions": {
+        "can_monitor_twitter": true,
+        "can_monitor_discord": true,
+        "can_manage_users": false,
+        "can_view_logs": false,
+        "can_manage_all_projects": false,
+        "can_create_projects_for_others": false
+      }
+    },
+    "f7a8e3d977a575d0": {
+      "telegram_id": 434205455,
+      "username": "Dima",
+      "password_hash": "273eefc53e509e24457cef6158594df15807d9bd96b72b36ad39aa6d967abd19",
+      "created_at": "2025-09-16T20:49:35.956401",
+      "last_login": null,
+      "login_attempts": 0,
+      "is_active": true,
+      "role": "user",
+      "permissions": {
+        "can_monitor_twitter": true,
+        "can_monitor_discord": true,
+        "can_manage_users": false,
+        "can_view_logs": false,
+        "can_manage_all_projects": false,
+        "can_create_projects_for_others": false
+      }
+    },
+    "8a8efe38af7c0627": {
+      "telegram_id": 5867748203,
+      "username": "Ilya",
+      "password_hash": "0307031f0f51b474552c28724c5c773b166b1a488b66cbe15d98f217a460bb6a",
+      "created_at": "2025-09-16T20:49:50.206752",
+      "last_login": null,
+      "login_attempts": 0,
+      "is_active": true,
+      "role": "user",
+      "permissions": {
+        "can_monitor_twitter": true,
+        "can_monitor_discord": true,
+        "can_manage_users": false,
+        "can_view_logs": false,
+        "can_manage_all_projects": false,
+        "can_create_projects_for_others": false
+      }
+    },
+    "0c06daca09cba246": {
+      "telegram_id": 514130797,
+      "username": "yakiv",
+      "password_hash": "240a592ca357cd3b432cf5ee29f780924b5b42f0038451cb275ddd576b58a8ed",
+      "created_at": "2025-09-16T20:50:14.757969",
+      "last_login": null,
+      "login_attempts": 0,
+      "is_active": true,
+      "role": "admin",
+      "permissions": {
+        "can_monitor_twitter": true,
+        "can_monitor_discord": true,
+        "can_manage_users": true,
+        "can_view_logs": true,
+        "can_manage_all_projects": true,
+        "can_create_projects_for_others": true
+      }
+    }
+  },
+  "settings": {
+    "default_password": "Gerbera401483",
+    "session_timeout_minutes": 30,
+    "max_login_attempts": 3
+  }
+}
