@@ -62,7 +62,7 @@ class ProjectManager:
         except Exception as e:
             self.logger.error(f"Помилка збереження даних: {e}")
             
-    def add_project(self, user_id: int, project_data: Dict, target_user_id: int = None) -> bool:
+    def add_project(self, user_id: int, project_data: Dict, target_user_id: Optional[int] = None) -> bool:
         """Додати новий проект"""
         try:
             # Якщо вказано target_user_id, перевіряємо права адміністратора
@@ -368,7 +368,7 @@ class ProjectManager:
             'last_updated': self.data['metadata']['last_updated']
         }
     
-    def export_data(self, export_file: str = None) -> str:
+    def export_data(self, export_file: Optional[str] = None) -> str:
         """Експортувати дані"""
         if not export_file:
             export_file = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -403,7 +403,7 @@ class ProjectManager:
             return False
     
     # Selenium Twitter Accounts Management
-    def add_selenium_account(self, username: str, added_by: int = None) -> bool:
+    def add_selenium_account(self, username: str, added_by: Optional[int] = None) -> bool:
         """Додати Twitter акаунт для Selenium моніторингу"""
         try:
             if 'selenium_accounts' not in self.data:

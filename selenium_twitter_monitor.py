@@ -8,6 +8,7 @@ import logging
 import time
 import json
 import os
+import urllib3
 from datetime import datetime
 from typing import Set, List, Dict, Optional
 from selenium import webdriver
@@ -17,6 +18,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+# Відключаємо попередження про SSL сертифікати
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Налаштування логування
 logging.basicConfig(
@@ -35,11 +39,15 @@ class SeleniumTwitterMonitor:
         self.seen_tweets = {}  # account -> set of tweet_ids
         self.sent_tweets = {}  # account -> set of sent tweet_ids
         self.monitoring_active = False
+        self.seen_tweets_file = "seen_tweets.json"
         
         # Створюємо папку профілю якщо не існує
         if not os.path.exists(self.profile_path):
             os.makedirs(self.profile_path)
             logger.info(f"Створено папку профілю: {self.profile_path}")
+        
+        # Завантажуємо збережені seen_tweets
+        self.load_seen_tweets()
         
         # Автоматично ініціалізуємо драйвер (у видимому режимі для простої авторизації)
         self._setup_driver(headless=False)
@@ -110,10 +118,32 @@ class SeleniumTwitterMonitor:
             
             # Налаштування сумісності для Windows Server/без GPU
             chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--disable-gpu-sandbox')
+            chrome_options.add_argument('--disable-software-rasterizer')
             chrome_options.add_argument('--window-size=1280,900')
             chrome_options.add_argument('--start-maximized')
             # У разі відсутності GPU дозволяємо софт-рендер
             chrome_options.add_argument('--enable-unsafe-swiftshader')
+            
+            # Виправлення audio помилок
+            chrome_options.add_argument('--disable-audio-output')
+            chrome_options.add_argument('--mute-audio')
+            chrome_options.add_argument('--disable-audio-input')
+            chrome_options.add_argument('--disable-audio-service-sandbox')
+            
+            # Виправлення WebGPU помилок
+            chrome_options.add_argument('--disable-webgl')
+            chrome_options.add_argument('--disable-webgl2')
+            chrome_options.add_argument('--disable-3d-apis')
+            chrome_options.add_argument('--disable-webgpu')
+            
+            # SSL налаштування для обходу проблем з сертифікатами
+            chrome_options.add_argument('--ignore-certificate-errors')
+            chrome_options.add_argument('--ignore-ssl-errors')
+            chrome_options.add_argument('--ignore-certificate-errors-spki-list')
+            chrome_options.add_argument('--disable-web-security')
+            chrome_options.add_argument('--allow-running-insecure-content')
+            
             # Режим без головки
             if headless:
                 chrome_options.add_argument('--headless=new')
@@ -150,6 +180,8 @@ class SeleniumTwitterMonitor:
         """Закрити драйвер"""
         if self.driver:
             try:
+                # Зберігаємо seen_tweets перед закриттям
+                self.save_seen_tweets()
                 self.driver.quit()
                 logger.info("Selenium драйвер закрито")
             except Exception as e:
@@ -168,6 +200,8 @@ class SeleniumTwitterMonitor:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Закрити сесію"""
         if self.driver:
+            # Зберігаємо seen_tweets перед закриттям
+            self.save_seen_tweets()
             self.driver.quit()
             logger.info("Selenium драйвер закрито")
             
@@ -391,8 +425,9 @@ class SeleniumTwitterMonitor:
             # Генеруємо стабільний ID на основі тексту якщо немає реального ID
             if text and len(text) > 10:
                 import hashlib
-                text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:12]
-                tweet_id = f"selenium_{text_hash}_{int(time.time())}"
+                content_for_hash = f"{username}_{text}".encode('utf-8')
+                text_hash = hashlib.md5(content_for_hash).hexdigest()[:16]
+                tweet_id = f"selenium_{text_hash}"
             
             # Спробуємо знайти посилання на твіт
             tweet_url = f"https://x.com/{username}"
@@ -577,20 +612,43 @@ class SeleniumTwitterMonitor:
                 
                 for tweet in tweets:
                     tweet_id = tweet.get('id')
+                    tweet_text = tweet.get('text', '').strip()
+                    
                     if tweet_id:
-                        # Перевіряємо чи цей твіт вже був відправлений
+                        # Перевіряємо чи цей твіт вже був відправлений за ID
                         if tweet_id in self.sent_tweets[username]:
                             continue
+                        
+                        # Додаткова перевірка за контентом
+                        if tweet_text:
+                            import hashlib
+                            content_hash = hashlib.md5(f"{username}_{tweet_text}".encode('utf-8')).hexdigest()[:12]
+                            content_key = f"content_{content_hash}"
+                            if content_key in self.sent_tweets[username]:
+                                logger.info(f"Selenium: контент твіта для {username} вже був відправлений, пропускаємо")
+                                continue
                             
                         # Додаємо до нових твітів
                         if tweet_id not in self.seen_tweets[username]:
                             new_tweets.append(tweet)
                             self.seen_tweets[username].add(tweet_id)
                             self.sent_tweets[username].add(tweet_id)
+                            
+                            # Додаємо хеш контенту до відправлених
+                            if tweet_text:
+                                import hashlib
+                                content_hash = hashlib.md5(f"{username}_{tweet_text}".encode('utf-8')).hexdigest()[:12]
+                                content_key = f"content_{content_hash}"
+                                self.sent_tweets[username].add(content_key)
+                            
                             logger.info(f"Selenium: знайдено новий твіт {tweet_id} для {username}")
                         
             except Exception as e:
                 logger.error(f"Помилка перевірки твітів для {username}: {e}")
+        
+        # Зберігаємо оброблені твіти після кожної перевірки
+        if new_tweets:
+            self.save_seen_tweets()
                 
         return new_tweets
     
@@ -712,6 +770,46 @@ class SeleniumTwitterMonitor:
         except Exception as e:
             logger.error(f"Помилка збереження профілю: {e}")
             return False
+    
+    def save_seen_tweets(self):
+        """Зберегти список оброблених твітів"""
+        try:
+            # Конвертуємо set у list для JSON серіалізації
+            data_to_save = {}
+            for account, tweet_ids in self.seen_tweets.items():
+                if isinstance(tweet_ids, set):
+                    data_to_save[account] = list(tweet_ids)
+                else:
+                    data_to_save[account] = tweet_ids
+            
+            with open(self.seen_tweets_file, 'w', encoding='utf-8') as f:
+                json.dump(data_to_save, f, ensure_ascii=False, indent=2)
+            logger.debug(f"Збережено seen_tweets для {len(data_to_save)} акаунтів")
+            return True
+        except Exception as e:
+            logger.error(f"Помилка збереження seen_tweets: {e}")
+            return False
+    
+    def load_seen_tweets(self):
+        """Завантажити список оброблених твітів"""
+        try:
+            if os.path.exists(self.seen_tweets_file):
+                with open(self.seen_tweets_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Конвертуємо list назад у set
+                for account, tweet_ids in data.items():
+                    if isinstance(tweet_ids, list):
+                        self.seen_tweets[account] = set(tweet_ids)
+                    else:
+                        self.seen_tweets[account] = set()
+                
+                logger.info(f"Завантажено seen_tweets для {len(self.seen_tweets)} акаунтів")
+            else:
+                logger.info("Файл seen_tweets.json не знайдено, починаємо з порожнього списку")
+        except Exception as e:
+            logger.error(f"Помилка завантаження seen_tweets: {e}")
+            self.seen_tweets = {}
 
 # Приклад використання
 async def main():

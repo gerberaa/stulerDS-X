@@ -640,15 +640,10 @@ class AccessManager:
             cleaned_count = 0
             
             inactive_users = []
-            for telegram_id, session_data in self.user_sessions.items():
-                last_activity = session_data.get('last_activity')
-                if last_activity:
-                    try:
-                        last_activity_time = datetime.fromisoformat(last_activity)
-                        if current_time - last_activity_time > timedelta(hours=24):  # 24 години неактивності
-                            inactive_users.append(telegram_id)
-                    except:
-                        inactive_users.append(telegram_id)
+            for telegram_id, last_activity_time in self.user_sessions.items():
+                # user_sessions містить datetime об'єкти, не словники
+                if current_time - last_activity_time > timedelta(hours=24):  # 24 години неактивності
+                    inactive_users.append(telegram_id)
             
             # Видаляємо неактивні сесії
             for telegram_id in inactive_users:

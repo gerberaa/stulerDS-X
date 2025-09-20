@@ -6,7 +6,12 @@ from typing import Dict, List, Optional, Set
 import json
 import re
 import random
+import ssl
+import urllib3
 from urllib.parse import urlparse, parse_qs
+
+# Відключаємо попередження про SSL сертифікати
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class TwitterMonitor:
     """Моніторинг Twitter/X акаунтів через автентифіковані API запити"""
@@ -18,7 +23,12 @@ class TwitterMonitor:
         self.monitoring_accounts = set()
         self.last_tweet_ids = {}  # account -> last_tweet_id
         self.sent_tweets = {}  # account -> set of sent tweet_ids
+        self.seen_tweets = {}  # account -> set of seen tweet_ids
         self.logger = logging.getLogger(__name__)
+        self.seen_tweets_file = "twitter_api_seen_tweets.json"
+        
+        # Завантажуємо збережені seen_tweets
+        self.load_seen_tweets()
         
     async def __aenter__(self):
         """Асинхронний контекстний менеджер"""
@@ -43,8 +53,20 @@ class TwitterMonitor:
             }
             
             timeout = aiohttp.ClientTimeout(total=15)
-            self.session = aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout)
-            self.logger.info("Twitter моніторинг ініціалізовано з auth_token")
+            
+            # Налаштування SSL для обходу проблем з сертифікатами
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            self.session = aiohttp.ClientSession(
+                headers=headers, 
+                cookies=cookies, 
+                timeout=timeout,
+                connector=connector
+            )
+            self.logger.info("Twitter моніторинг ініціалізовано з auth_token та SSL налаштуваннями")
         else:
             self.logger.warning("Twitter auth_token не встановлено! Twitter моніторинг буде відключено")
         return self
@@ -64,6 +86,9 @@ class TwitterMonitor:
                 # Ініціалізуємо множину відправлених твітів для нового акаунта
                 if clean_username not in self.sent_tweets:
                     self.sent_tweets[clean_username] = set()
+                # Ініціалізуємо множину оброблених твітів для нового акаунта
+                if clean_username not in self.seen_tweets:
+                    self.seen_tweets[clean_username] = set()
                 self.logger.info(f"Додано акаунт для моніторингу: {clean_username}")
                 return True
         except Exception as e:
@@ -80,6 +105,10 @@ class TwitterMonitor:
                     del self.last_tweet_ids[clean_username]
                 if clean_username in self.sent_tweets:
                     del self.sent_tweets[clean_username]
+                if clean_username in self.seen_tweets:
+                    del self.seen_tweets[clean_username]
+                # Зберігаємо зміни
+                self.save_seen_tweets()
                 self.logger.info(f"Видалено акаунт з моніторингу: {clean_username}")
                 return True
         except Exception as e:
@@ -231,8 +260,14 @@ class TwitterMonitor:
                     else:
                         self.logger.error(f"User_id не знайдено в відповіді для {username}")
                         return None
+                elif response.status == 404:
+                    self.logger.warning(f"Акаунт {username} не знайдено (404), використовуємо HTML парсинг")
+                    return None
+                elif response.status == 401:
+                    self.logger.warning(f"Unauthorized для {username}, використовуємо HTML парсинг")
+                    return None
                 else:
-                    self.logger.error(f"Помилка отримання user_id для {username}: {response.status}")
+                    self.logger.warning(f"Помилка отримання user_id для {username}: {response.status}, використовуємо HTML парсинг")
                     return None
                     
         except Exception as e:
@@ -250,7 +285,13 @@ class TwitterMonitor:
             }
             
             url = f"https://x.com/{username}"
-            response = requests.get(url, headers=headers, timeout=15)
+            
+            # Налаштування SSL для requests
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            response = requests.get(url, headers=headers, timeout=15, verify=False)
             
             if response.status_code == 200:
                 html = response.text
@@ -495,10 +536,11 @@ class TwitterMonitor:
                         
                         # Генеруємо стабільний ID на основі тексту якщо немає реального ID
                         if not real_tweet_id.startswith(('1', '2', '3', '4', '5', '6', '7', '8', '9')):
-                            # Створюємо хеш на основі тексту та часу для стабільності
+                            # Створюємо стабільний хеш на основі тексту та username (без часу для стабільності)
                             import hashlib
-                            text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:12]
-                            real_tweet_id = f"html_{text_hash}_{int(datetime.now().timestamp())}"
+                            content_for_hash = f"{username}_{text}".encode('utf-8')
+                            text_hash = hashlib.md5(content_for_hash).hexdigest()[:16]
+                            real_tweet_id = f"html_{text_hash}"
                         
                         tweets.append({
                             'id': real_tweet_id,
@@ -534,9 +576,11 @@ class TwitterMonitor:
                 if not tweets:
                     continue
                 
-                # Ініціалізуємо множину відправлених твітів якщо не існує
+                # Ініціалізуємо множини якщо не існують
                 if username not in self.sent_tweets:
                     self.sent_tweets[username] = set()
+                if username not in self.seen_tweets:
+                    self.seen_tweets[username] = set()
                     
                 # Знаходимо нові твіти
                 last_id = self.last_tweet_ids.get(username)
@@ -545,19 +589,36 @@ class TwitterMonitor:
                 if last_id is None:
                     if tweets:
                         self.last_tweet_ids[username] = tweets[0]['id']
-                        # Додаємо всі поточні твіти до відправлених (щоб не спамити при першому запуску)
+                        # Додаємо всі поточні твіти до відправлених та оброблених (щоб не спамити при першому запуску)
                         for tweet in tweets:
                             self.sent_tweets[username].add(tweet['id'])
+                            self.seen_tweets[username].add(tweet['id'])
+                        # Зберігаємо зміни
+                        self.save_seen_tweets()
                     continue
                     
                 # Шукаємо нові твіти
                 found_new = False
                 for tweet in tweets:
                     tweet_id = tweet['id']
+                    tweet_text = tweet.get('text', '').strip()
                     
-                    # Перевіряємо чи цей твіт вже був відправлений
+                    # Перевіряємо чи цей твіт вже був оброблений
+                    if tweet_id in self.seen_tweets[username]:
+                        continue
+                    
+                    # Перевіряємо чи цей твіт вже був відправлений за ID
                     if tweet_id in self.sent_tweets[username]:
                         continue
+                    
+                    # Додаткова перевірка за контентом
+                    if tweet_text:
+                        import hashlib
+                        content_hash = hashlib.md5(f"{username}_{tweet_text}".encode('utf-8')).hexdigest()[:12]
+                        content_key = f"content_{content_hash}"
+                        if content_key in self.sent_tweets[username]:
+                            self.logger.info(f"Контент твіта для {username} вже був відправлений, пропускаємо")
+                            continue
                     
                     # Якщо знайшли останній відомий твіт - зупиняємося
                     if tweet_id == last_id:
@@ -575,8 +636,16 @@ class TwitterMonitor:
                         'url': tweet.get('url', f"https://twitter.com/{username}")
                     })
                     
-                    # Додаємо твіт до відправлених
+                    # Додаємо твіт до оброблених та відправлених
+                    self.seen_tweets[username].add(tweet_id)
                     self.sent_tweets[username].add(tweet_id)
+                    
+                    # Додаємо хеш контенту до відправлених
+                    if tweet_text:
+                        import hashlib
+                        content_hash = hashlib.md5(f"{username}_{tweet_text}".encode('utf-8')).hexdigest()[:12]
+                        content_key = f"content_{content_hash}"
+                        self.sent_tweets[username].add(content_key)
                     
                 # Діагностичне логування
                 if found_new:
@@ -588,6 +657,10 @@ class TwitterMonitor:
                     
             except Exception as e:
                 self.logger.error(f"Помилка перевірки акаунта {username}: {e}")
+        
+        # Зберігаємо оброблені твіти після кожної перевірки
+        if new_tweets:
+            self.save_seen_tweets()
                 
         return new_tweets
         
@@ -652,3 +725,46 @@ class TwitterMonitor:
             text = text.replace(char, f'\\{char}')
             
         return text
+    
+    def save_seen_tweets(self):
+        """Зберегти список оброблених твітів"""
+        try:
+            import json
+            # Конвертуємо set у list для JSON серіалізації
+            data_to_save = {}
+            for account, tweet_ids in self.seen_tweets.items():
+                if isinstance(tweet_ids, set):
+                    data_to_save[account] = list(tweet_ids)
+                else:
+                    data_to_save[account] = tweet_ids
+            
+            with open(self.seen_tweets_file, 'w', encoding='utf-8') as f:
+                json.dump(data_to_save, f, ensure_ascii=False, indent=2)
+            self.logger.debug(f"Збережено seen_tweets для {len(data_to_save)} акаунтів")
+            return True
+        except Exception as e:
+            self.logger.error(f"Помилка збереження seen_tweets: {e}")
+            return False
+    
+    def load_seen_tweets(self):
+        """Завантажити список оброблених твітів"""
+        try:
+            import json
+            import os
+            if os.path.exists(self.seen_tweets_file):
+                with open(self.seen_tweets_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Конвертуємо list назад у set
+                for account, tweet_ids in data.items():
+                    if isinstance(tweet_ids, list):
+                        self.seen_tweets[account] = set(tweet_ids)
+                    else:
+                        self.seen_tweets[account] = set()
+                
+                self.logger.info(f"Завантажено seen_tweets для {len(self.seen_tweets)} акаунтів")
+            else:
+                self.logger.info("Файл twitter_api_seen_tweets.json не знайдено, починаємо з порожнього списку")
+        except Exception as e:
+            self.logger.error(f"Помилка завантаження seen_tweets: {e}")
+            self.seen_tweets = {}

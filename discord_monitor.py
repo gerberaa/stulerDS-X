@@ -16,6 +16,17 @@ class DiscordMonitor:
         
     async def __aenter__(self):
         """Async context manager entry"""
+        if not self.authorization:
+            self.logger.warning("Discord authorization токен не налаштовано")
+            return self
+            
+        # Налаштування SSL для обходу проблем з сертифікатами
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
         self.session = aiohttp.ClientSession(
             headers={
                 'Authorization': self.authorization,
@@ -23,7 +34,8 @@ class DiscordMonitor:
                 'Content-Type': 'application/json',
                 'X-RateLimit-Precision': 'millisecond'
             },
-            timeout=aiohttp.ClientTimeout(total=10)
+            timeout=aiohttp.ClientTimeout(total=10),
+            connector=connector
         )
         return self
         
@@ -76,11 +88,16 @@ class DiscordMonitor:
                     messages = await response.json()
                     return messages
                 elif response.status == 401:
-                    self.logger.error("Unauthorized: неправильний authorization токен")
+                    self.logger.warning("Unauthorized: неправильний authorization токен або токен застарів")
+                    return []
                 elif response.status == 403:
-                    self.logger.error("Forbidden: немає доступу до каналу")
+                    self.logger.warning("Forbidden: немає доступу до каналу")
+                    return []
+                elif response.status == 404:
+                    self.logger.warning(f"Канал {channel_id} не знайдено")
+                    return []
                 else:
-                    self.logger.error(f"Помилка отримання повідомлень: {response.status}")
+                    self.logger.warning(f"Помилка отримання повідомлень: {response.status}")
                 return []
                 
         except Exception as e:
@@ -91,16 +108,23 @@ class DiscordMonitor:
         """Перевірити нові повідомлення у всіх каналах (виправлено)"""
         new_messages = []
         
+        self.logger.info(f"🔍 Перевіряємо {len(self.monitoring_channels)} Discord каналів: {list(self.monitoring_channels)}")
+        
         for i, channel_id in enumerate(self.monitoring_channels):
             try:
                 # Додаємо затримку між запитами до різних каналів
                 if i > 0:
                     await asyncio.sleep(1)  # 1 секунда між каналами
                 
+                self.logger.info(f"🔍 Перевіряємо Discord канал {channel_id}...")
+                
                 # Отримуємо повідомлення
                 messages = await self.get_channel_messages(channel_id, limit=5)
                 if not messages:
+                    self.logger.info(f"⚠️ Discord канал {channel_id}: повідомлень не знайдено")
                     continue
+                
+                self.logger.info(f"📨 Discord канал {channel_id}: отримано {len(messages)} повідомлень")
                     
                 # Знаходимо нові повідомлення
                 last_id = self.last_message_ids.get(channel_id)
@@ -137,7 +161,9 @@ class DiscordMonitor:
                 
                 # Діагностичне логування
                 if found_new:
-                    self.logger.info(f"Канал {channel_id}: знайдено нові повідомлення, останнє відоме: {last_id}")
+                    self.logger.info(f"✅ Канал {channel_id}: знайдено нові повідомлення, останнє відоме: {last_id}")
+                else:
+                    self.logger.info(f"ℹ️ Канал {channel_id}: нових повідомлень немає")
                     
                 # Оновлюємо останнє повідомлення на найновіше
                 if messages:
@@ -145,7 +171,8 @@ class DiscordMonitor:
                     
             except Exception as e:
                 self.logger.error(f"Помилка перевірки каналу {channel_id}: {e}")
-                
+        
+        self.logger.info(f"📊 Discord моніторинг: знайдено {len(new_messages)} нових повідомлень загалом")
         return new_messages
     
     def _extract_message_images(self, message: Dict) -> List[str]:

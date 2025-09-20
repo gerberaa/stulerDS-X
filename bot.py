@@ -5,7 +5,7 @@ import requests
 import tempfile
 import os
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional, Any, Set
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, JobQueue
 from security_manager import SecurityManager
@@ -27,25 +27,33 @@ logger = logging.getLogger(__name__)
 security_manager = SecurityManager(SECURITY_TIMEOUT)
 project_manager = ProjectManager()
 discord_monitor = DiscordMonitor(DISCORD_AUTHORIZATION) if DISCORD_AUTHORIZATION else None
-twitter_monitor = TwitterMonitor(TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN) if TWITTER_AUTH_TOKEN else None
+twitter_monitor = TwitterMonitor(TWITTER_AUTH_TOKEN, TWITTER_CSRF_TOKEN) if TWITTER_AUTH_TOKEN and TWITTER_CSRF_TOKEN else None
 selenium_twitter_monitor = None  # Ініціалізується при потребі
 
 # Словник для зберігання стану користувачів (очікують пароль)
 waiting_for_password = {}
 
 # Словник для зберігання стану додавання проектів
-user_states = {}  # user_id -> {'state': 'adding_project', 'data': {...}}
+user_states: Dict[int, Dict[str, Any]] = {}  # user_id -> {'state': 'adding_project', 'data': {...}}
 
 # Глобальна змінна для зберігання активного бота
 bot_instance = None
 
 # Глобальна система відстеження відправлених твітів
-global_sent_tweets = {}  # account -> set of sent tweet_ids
+global_sent_tweets: Dict[str, Set[str]] = {}  # account -> set of sent tweet_ids
+
+# Глобальні змінні для UI
+user_states = {}  # Зберігаємо стани користувачів для форм
+waiting_for_password = {}  # Користувачі, які очікують введення паролю
+main_menu_messages = {}  # Зберігаємо ID головних меню для редагування
 
 # Декоратор авторизації має бути оголошений до використання
 def require_auth(func):
     """Декоратор для перевірки авторизації користувача"""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message:
+            return
+        
         user_id = update.effective_user.id
         
         # Перевіряємо чи користувач авторизований
@@ -54,7 +62,6 @@ def require_auth(func):
                 "🔐 **Доступ обмежено!**\n\n"
                 "Для використання цієї команди необхідна авторизація.\n"
                 "Використовуйте команду /login для входу в систему.",
-                parse_mode='Markdown'
             )
             return
         
@@ -69,12 +76,28 @@ def sync_monitors_with_projects() -> None:
     try:
         # Збираємо цільові Twitter usernames із проектів
         project_usernames = set()
-        for _, projects in project_manager.data.get('projects', {}).items():
+        discord_channels = {}  # channel_id -> original_url
+        
+        logger.info("🔍 Аналізуємо всі проекти...")
+        for user_id, projects in project_manager.data.get('projects', {}).items():
+            logger.info(f"👤 Користувач {user_id}: {len(projects)} проектів")
             for p in projects:
                 if p.get('platform') == 'twitter':
-                    username = extract_twitter_username(p.get('url', ''))
-                    if username:
-                        project_usernames.add(username)
+                    url = p.get('url', '')
+                    sync_username = extract_twitter_username(url)
+                    logger.info(f"   🐦 Twitter проект: URL='{url}' -> username='{sync_username}'")
+                    if sync_username:
+                        project_usernames.add(sync_username)
+                elif p.get('platform') == 'discord':
+                    url = p.get('url', '')
+                    channel_id = extract_discord_channel_id(url)
+                    logger.info(f"   💬 Discord проект: URL='{url}' -> channel_id='{channel_id}'")
+                    if channel_id:
+                        discord_channels[channel_id] = url  # Зберігаємо оригінальний URL
+        
+        logger.info(f"📊 Результат аналізу:")
+        logger.info(f"   🐦 Знайдено Twitter usernames: {list(project_usernames)}")
+        logger.info(f"   💬 Знайдено Discord channels: {list(discord_channels.keys())}")
 
         # Додаємо явно збережені selenium акаунти (якщо ще є)
         selenium_saved = set(project_manager.get_selenium_accounts() or [])
@@ -87,13 +110,16 @@ def sync_monitors_with_projects() -> None:
             # Видаляємо зайві
             for username in list(current - target_usernames):
                 try:
-                    twitter_monitor.remove_account(username)
+                    if username:
+                        twitter_monitor.remove_account(username)
+                        logger.info(f"🗑️ Видалено Twitter акаунт з моніторингу: {username}")
                 except Exception:
                     pass
             # Додаємо відсутні (із проектів/selenium_saved)
             for username in list(target_usernames - current):
                 try:
                     twitter_monitor.add_account(username)
+                    logger.info(f"➕ Додано Twitter акаунт до моніторингу: {username}")
                 except Exception:
                     pass
 
@@ -104,35 +130,126 @@ def sync_monitors_with_projects() -> None:
             # Видаляємо зайві
             for username in list(current - target_usernames):
                 selenium_twitter_monitor.monitoring_accounts.discard(username)
-                if username in selenium_twitter_monitor.seen_tweets:
-                    del selenium_twitter_monitor.seen_tweets[username]
+                logger.info(f"🗑️ Видалено Selenium акаунт з моніторингу: {username}")
             # Додаємо відсутні
             for username in list(target_usernames - current):
-                selenium_twitter_monitor.add_account(username)
+                selenium_twitter_monitor.monitoring_accounts.add(username)
+                logger.info(f"➕ Додано Selenium акаунт до моніторингу: {username}")
 
-        # Синхронізація Discord каналів
+        # Синхронізація Discord монітора
         global discord_monitor
         if discord_monitor is not None:
-            project_channels = set()
-            for _, projects in project_manager.data.get('projects', {}).items():
-                for p in projects:
-                    if p.get('platform') == 'discord':
-                        ch = extract_discord_channel_id(p.get('url', ''))
-                        if ch:
-                            project_channels.add(ch)
-            current = set(getattr(discord_monitor, 'monitoring_channels', set()))
-            for ch in list(current - project_channels):
-                discord_monitor.monitoring_channels.discard(ch)
-                if ch in discord_monitor.last_message_ids:
-                    del discord_monitor.last_message_ids[ch]
-            for ch in list(project_channels - current):
+            current_channels = set(str(ch) for ch in getattr(discord_monitor, 'monitoring_channels', []))
+            logger.info(f"🔄 Discord монітор: поточні канали = {list(current_channels)}")
+            logger.info(f"🔄 Discord монітор: цільові канали = {list(discord_channels.keys())}")
+            
+            # Додаємо нові канали
+            for channel_id, original_url in discord_channels.items():
+                if channel_id not in current_channels:
+                    try:
+                        discord_monitor.add_channel(original_url)  # Передаємо оригінальний URL
+                        logger.info(f"➕ Додано Discord канал до моніторингу: {channel_id} ({original_url})")
+                    except Exception as e:
+                        logger.error(f"❌ Помилка додавання Discord каналу {channel_id}: {e}")
+            # Видаляємо зайві канали
+            for channel_id in current_channels - set(discord_channels.keys()):
                 try:
-                    # Reconstruct URL for add_channel convenience
-                    discord_monitor.add_channel(f"https://discord.com/channels/0/{ch}")
-                except Exception:
-                    pass
+                    discord_monitor.remove_channel(channel_id)
+                    logger.info(f"🗑️ Видалено Discord канал з моніторингу: {channel_id}")
+                except Exception as e:
+                    logger.error(f"❌ Помилка видалення Discord каналу {channel_id}: {e}")
+        else:
+            logger.warning("⚠️ Discord монітор не ініціалізовано (DISCORD_AUTHORIZATION відсутній?)")
+
+        if target_usernames:
+            logger.info(f"🔄 Синхронізовано Twitter моніторинг: {len(target_usernames)} акаунтів")
+        if discord_channels:
+            logger.info(f"🔄 Синхронізовано Discord моніторинг: {len(discord_channels)} каналів")
+            
+        # Завжди намагаємося запустити моніторинг
+        logger.info("🚀 Автоматично запускаємо моніторинг...")
+        auto_start_monitoring()
+        
+        if target_usernames or discord_channels:
+            logger.info(f"✅ Знайдено проекти для моніторингу: {len(target_usernames)} Twitter + {len(discord_channels)} Discord")
+        else:
+            logger.info("ℹ️ Поки що немає проектів для моніторингу, але монітори готові до роботи")
+
     except Exception as e:
         logger.error(f"Помилка синхронізації моніторів: {e}")
+
+def auto_start_monitoring() -> None:
+    """Автоматично запустити всі доступні монітори"""
+    try:
+        global twitter_monitor, selenium_twitter_monitor, discord_monitor
+        import threading
+        
+        # Запускаємо Twitter API моніторинг
+        if twitter_monitor and hasattr(twitter_monitor, 'monitoring_accounts'):
+            accounts = getattr(twitter_monitor, 'monitoring_accounts', set())
+            if accounts and TWITTER_AUTH_TOKEN:
+                logger.info(f"🐦 Автоматично запускаємо Twitter API моніторинг для {len(accounts)} акаунтів")
+                try:
+                    # Запускаємо в окремому потоці якщо ще не запущено
+                    if not hasattr(auto_start_monitoring, '_twitter_started'):
+                        twitter_thread = threading.Thread(target=lambda: asyncio.run(start_twitter_monitoring()))
+                        twitter_thread.daemon = True
+                        twitter_thread.start()
+                        auto_start_monitoring._twitter_started = True
+                        logger.info("✅ Twitter API моніторинг автоматично запущено")
+                except Exception as e:
+                    logger.error(f"Помилка запуску Twitter моніторингу: {e}")
+        
+        # Запускаємо Selenium Twitter моніторинг
+        if selenium_twitter_monitor and hasattr(selenium_twitter_monitor, 'monitoring_accounts'):
+            accounts = getattr(selenium_twitter_monitor, 'monitoring_accounts', set())
+            if accounts:
+                logger.info(f"🚀 Автоматично запускаємо Selenium Twitter моніторинг для {len(accounts)} акаунтів")
+                try:
+                    # Запускаємо в окремому потоці якщо ще не запущено
+                    if not hasattr(auto_start_monitoring, '_selenium_started'):
+                        selenium_thread = threading.Thread(target=lambda: asyncio.run(start_selenium_twitter_monitoring()))
+                        selenium_thread.daemon = True
+                        selenium_thread.start()
+                        auto_start_monitoring._selenium_started = True
+                        logger.info("✅ Selenium Twitter моніторинг автоматично запущено")
+                except Exception as e:
+                    logger.error(f"Помилка запуску Selenium моніторингу: {e}")
+        
+        # Запускаємо Discord моніторинг
+        logger.info(f"💬 Discord монітор: {'✅ Ініціалізовано' if discord_monitor else '❌ Не ініціалізовано'}")
+        if discord_monitor:
+            logger.info(f"💬 Discord монітор має атрибут 'monitoring_channels': {'✅ Так' if hasattr(discord_monitor, 'monitoring_channels') else '❌ Ні'}")
+            if hasattr(discord_monitor, 'monitoring_channels'):
+                channels = getattr(discord_monitor, 'monitoring_channels', [])
+                logger.info(f"💬 Discord монітор: знайдено {len(channels)} каналів: {channels}")
+                logger.info(f"💬 Discord AUTHORIZATION: {'✅ Є' if DISCORD_AUTHORIZATION else '❌ Відсутній'}")
+                
+                if channels and DISCORD_AUTHORIZATION:
+                    logger.info(f"💬 Автоматично запускаємо Discord моніторинг для {len(channels)} каналів")
+                    try:
+                        # Запускаємо в окремому потоці якщо ще не запущено
+                        if not hasattr(auto_start_monitoring, '_discord_started'):
+                            discord_thread = threading.Thread(target=lambda: asyncio.run(start_discord_monitoring()))
+                            discord_thread.daemon = True
+                            discord_thread.start()
+                            auto_start_monitoring._discord_started = True
+                            logger.info("✅ Discord моніторинг автоматично запущено")
+                    except Exception as e:
+                        logger.error(f"Помилка запуску Discord моніторингу: {e}")
+                elif not channels:
+                    logger.info("ℹ️ Discord монітор: немає каналів для моніторингу")
+                elif not DISCORD_AUTHORIZATION:
+                    logger.warning("⚠️ Discord моніторинг пропущено: відсутній DISCORD_AUTHORIZATION")
+            else:
+                logger.warning("⚠️ Discord монітор не має атрибута 'monitoring_channels'")
+        else:
+            logger.warning("⚠️ Discord монітор не ініціалізовано (DISCORD_AUTHORIZATION відсутній?)")
+        
+        logger.info("✅ Автоматичний запуск всіх моніторів завершено")
+        
+    except Exception as e:
+        logger.error(f"Помилка автоматичного запуску моніторингу: {e}")
 
 # ===================== Утиліти для Telegram chat_id =====================
 def normalize_chat_id(chat_id_value: str) -> str:
@@ -171,6 +288,29 @@ def get_users_tracking_discord_channel(channel_id: str) -> List[int]:
     except Exception:
         return []
 
+def get_discord_server_name(channel_id: str, guild_id: str) -> str:
+    """Отримати назву Discord сервера з проекту користувача"""
+    try:
+        # Шукаємо проект з цим channel_id
+        for user_id_str, projects in project_manager.data.get('projects', {}).items():
+            for project in projects:
+                if project.get('platform') == 'discord':
+                    project_channel_id = extract_discord_channel_id(project.get('url', ''))
+                    if project_channel_id == channel_id:
+                        # Повертаємо назву проекту як назву сервера
+                        project_name = project.get('name', 'Discord')
+                        # Якщо назва проекту вже містить "Discord", не дублюємо
+                        if 'Discord' in project_name:
+                            return project_name
+                        else:
+                            return f"Discord Server ({project_name})"
+        
+        # Якщо не знайшли, повертаємо з guild_id
+        return f"Discord Server ({guild_id})"
+    except Exception as e:
+        logger.error(f"Помилка отримання назви Discord сервера: {e}")
+        return f"Discord Server ({guild_id})"
+
 # ===================== Визначення отримувачів за проектами =====================
 def get_users_tracking_twitter(username: str) -> List[int]:
     """Повертає список telegram_id користувачів, що мають проект з цим Twitter username."""
@@ -188,25 +328,13 @@ def get_users_tracking_twitter(username: str) -> List[int]:
     except Exception:
         return []
 
-def get_users_tracking_discord_channel(channel_id: str) -> List[int]:
-    """Повертає список telegram_id користувачів, що мають проект з цим Discord channel_id."""
-    try:
-        tracked_users: List[int] = []
-        target = str(channel_id)
-        for user_id_str, projects in project_manager.data.get('projects', {}).items():
-            for p in projects:
-                if p.get('platform') == 'discord':
-                    ch = extract_discord_channel_id(p.get('url', '') or '')
-                    if ch and ch == target:
-                        tracked_users.append(int(user_id_str))
-                        break
-        return tracked_users
-    except Exception:
-        return []
 
 @require_auth
 async def handle_forwarded_channel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE, fwd_chat) -> None:
     """Автоматичне налаштування каналу за пересланим повідомленням з каналу/групи."""
+    if not update.effective_user or not update.message:
+        return
+        
     user_id = update.effective_user.id
     try:
         chat_type = getattr(fwd_chat, 'type', '')
@@ -227,7 +355,6 @@ async def handle_forwarded_channel_setup(update: Update, context: ContextTypes.D
             await update.message.reply_text(f"⚠️ Не вдалося надіслати повідомлення у канал: {e}")
         await update.message.reply_text(
             f"✅ Автоналаштування завершено!\n\nКанал: {title}\nID: `{normalize_chat_id(channel_id_str)}`",
-            parse_mode='Markdown'
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка автоналаштування: {e}")
@@ -235,19 +362,24 @@ async def handle_forwarded_channel_setup(update: Update, context: ContextTypes.D
 # ===================== Персональні налаштування пересилання =====================
 @require_auth
 async def forward_enable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+        
     user_id = update.effective_user.id
     if project_manager.enable_forward(user_id):
         status = project_manager.get_forward_status(user_id)
         channel_id = status.get('channel_id') or '—'
         await update.message.reply_text(
             f"🟢 Пересилання увімкнено. Поточний канал: `{channel_id}`",
-            parse_mode='Markdown'
         )
     else:
         await update.message.reply_text("❌ Не вдалося увімкнути пересилання.")
 
 @require_auth
 async def forward_disable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+        
     user_id = update.effective_user.id
     if project_manager.disable_forward(user_id):
         await update.message.reply_text("🔴 Пересилання вимкнено.")
@@ -256,6 +388,9 @@ async def forward_disable_command(update: Update, context: ContextTypes.DEFAULT_
 
 @require_auth
 async def forward_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+        
     user_id = update.effective_user.id
     status = project_manager.get_forward_status(user_id)
     enabled = status.get('enabled', False)
@@ -265,11 +400,13 @@ async def forward_status_command(update: Update, context: ContextTypes.DEFAULT_T
         f"• Статус: {'🟢 Увімкнено' if enabled else '🔴 Вимкнено'}\n"
         f"• Канал: `{channel_id}`\n\n"
         f"Як налаштувати канал: додайте бота як адміністратора в канал/групу та напишіть там: @" + context.bot.username + " ping",
-        parse_mode='Markdown'
     )
 
 @require_auth
 async def forward_set_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+        
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
@@ -280,13 +417,15 @@ async def forward_set_channel_command(update: Update, context: ContextTypes.DEFA
     if project_manager.set_forward_channel(user_id, str(channel_id)):
         await update.message.reply_text(
             f"✅ Канал пересилання збережено: `{channel_id}`",
-            parse_mode='Markdown'
         )
     else:
         await update.message.reply_text("❌ Не вдалося зберегти канал.")
 
 @require_auth
 async def forward_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+        
     user_id = update.effective_user.id
     channel_id = project_manager.get_forward_channel(user_id)
     if not channel_id:
@@ -308,18 +447,70 @@ async def forward_test_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"❌ Виняток: {e}")
 
 def cleanup_old_tweets():
-    """Очистити старі твіти з глобального відстеження (залишити тільки останні 100)"""
+    """Очистити старі твіти з глобального відстеження (залишити тільки останні 200)"""
     global global_sent_tweets
     
     for account in global_sent_tweets:
-        if len(global_sent_tweets[account]) > 100:
-            # Конвертуємо в список, сортуємо та залишаємо останні 100
+        if len(global_sent_tweets[account]) > 200:
+            # Конвертуємо в список та залишаємо останні 200 записів
             tweets_list = list(global_sent_tweets[account])
-            tweets_list.sort(reverse=True)  # Сортуємо за ID (найновіші першими)
-            global_sent_tweets[account] = set(tweets_list[:100])
-            logger.info(f"Очищено старі твіти для {account}, залишено {len(global_sent_tweets[account])} твітів")
+            
+            # Розділяємо на ID твітів та хеші контенту
+            tweet_ids = [t for t in tweets_list if not t.startswith('content_')]
+            content_hashes = [t for t in tweets_list if t.startswith('content_')]
+            
+            # Залишаємо останні 100 ID твітів та 100 хешів контенту
+            tweet_ids = tweet_ids[-100:] if len(tweet_ids) > 100 else tweet_ids
+            content_hashes = content_hashes[-100:] if len(content_hashes) > 100 else content_hashes
+            
+            # Об'єднуємо та оновлюємо
+            global_sent_tweets[account] = set(tweet_ids + content_hashes)
+            logger.info(f"Очищено старі твіти для {account}, залишено {len(global_sent_tweets[account])} записів")
 
- 
+def format_success_message(title: str, message: str, additional_info: str = None) -> str:
+    """Форматувати повідомлення про успіх"""
+    formatted = f"✅ {title}\n\n{message}"
+    if additional_info:
+        formatted += f"\n\n💡 {additional_info}"
+    return formatted
+
+def format_error_message(title: str, error: str, suggestion: str = None) -> str:
+    """Форматувати повідомлення про помилку"""
+    formatted = f"❌ {title}\n\n{error}"
+    if suggestion:
+        formatted += f"\n\n💡 Рекомендація: {suggestion}"
+    return formatted
+
+def format_info_message(title: str, message: str, details: str = None) -> str:
+    """Форматувати інформаційне повідомлення"""
+    formatted = f"ℹ️ {title}\n\n{message}"
+    if details:
+        formatted += f"\n\n📋 Деталі:\n{details}"
+    return formatted
+
+def format_warning_message(title: str, message: str, action: str = None) -> str:
+    """Форматувати попереджувальне повідомлення"""
+    formatted = f"⚠️ {title}\n\n{message}"
+    if action:
+        formatted += f"\n\n🔧 Дія: {action}"
+    return formatted
+
+async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 3):
+    """Видалити повідомлення через певний час"""
+    try:
+        await asyncio.sleep(delay)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.warning(f"Не вдалося видалити повідомлення {message_id}: {e}")
+
+async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    """Безпечно видалити повідомлення"""
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception as e:
+        logger.warning(f"Не вдалося видалити повідомлення {message_id}: {e}")
+        return False
 
 def download_and_send_image(image_url: str, chat_id: str, caption: str = "") -> bool:
     """Завантажити та відправити зображення в Telegram"""
@@ -372,7 +563,6 @@ def download_and_send_image(image_url: str, chat_id: str, caption: str = "") -> 
                 data = {
                     'chat_id': normalize_chat_id(chat_id),
                     'caption': caption[:1024] if caption else '',  # Telegram обмежує caption до 1024 символів
-                    'parse_mode': 'Markdown'
                 }
                 
                 response = requests.post(url, files=files, data=data, timeout=30)
@@ -396,20 +586,33 @@ def download_and_send_image(image_url: str, chat_id: str, caption: str = "") -> 
         logger.error(f"Помилка завантаження/відправки зображення: {e}")
         return False
 
-def get_main_menu_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
+def get_main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     """Створити головне меню з урахуванням ролі користувача"""
     keyboard = [
-        [InlineKeyboardButton("📋 Мої проекти", callback_data="my_projects")],
-        [InlineKeyboardButton("➕ Додати проект", callback_data="add_project")],
-        [InlineKeyboardButton("🐦 Selenium Twitter", callback_data="selenium_twitter")],
-        [InlineKeyboardButton("📜 Історія Discord", callback_data="discord_history")],
-        [InlineKeyboardButton("📢 Пересилання", callback_data="forward_settings")],
-        [InlineKeyboardButton("⚙️ Налаштування", callback_data="settings")]
+        # Основні функції
+        [InlineKeyboardButton("📋 Мої проекти", callback_data="my_projects"),
+         InlineKeyboardButton("➕ Створити проект", callback_data="add_project")],
+        
+        # Моніторинг
+        [InlineKeyboardButton("🐦 Twitter", callback_data="selenium_twitter"),
+         InlineKeyboardButton("💬 Discord", callback_data="discord_history")],
+        
+        # Швидкі дії
+        [InlineKeyboardButton("⚡ Швидкі дії", callback_data="quick_actions"),
+         InlineKeyboardButton("📊 Статистика", callback_data="user_stats")],
+        
+        # Налаштування
+        [InlineKeyboardButton("📢 Пересилання", callback_data="forward_settings"),
+         InlineKeyboardButton("⚙️ Налаштування", callback_data="settings")],
+        
+        # Допомога та інформація
+        [InlineKeyboardButton("❓ Допомога", callback_data="help"),
+         InlineKeyboardButton("ℹ️ Про бота", callback_data="about")]
     ]
     
     # Додаємо адміністративні кнопки для адміністраторів
     if user_id and access_manager.is_admin(user_id):
-        keyboard.append([InlineKeyboardButton("👑 Адмін панель", callback_data="admin_panel")])
+        keyboard.append([InlineKeyboardButton("👑 Адміністративна панель", callback_data="admin_panel")])
     
     return InlineKeyboardMarkup(keyboard)
 
@@ -555,6 +758,46 @@ def get_forward_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     
     return InlineKeyboardMarkup(keyboard)
 
+def get_quick_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Створити клавіатуру швидких дій"""
+    keyboard = [
+        [InlineKeyboardButton("🚀 Запустити всі монітори", callback_data="start_all_monitors")],
+        [InlineKeyboardButton("⏹️ Зупинити всі монітори", callback_data="stop_all_monitors")],
+        [InlineKeyboardButton("📊 Швидка статистика", callback_data="quick_stats")],
+        [InlineKeyboardButton("🔍 Діагностика", callback_data="diagnostics")],
+        [InlineKeyboardButton("📝 Останні повідомлення", callback_data="recent_messages")],
+        [InlineKeyboardButton("🔄 Оновити дані", callback_data="refresh_data")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_help_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру допомоги"""
+    keyboard = [
+        [InlineKeyboardButton("🚀 Початок роботи", callback_data="help_getting_started")],
+        [InlineKeyboardButton("🐦 Twitter налаштування", callback_data="help_twitter")],
+        [InlineKeyboardButton("💬 Discord налаштування", callback_data="help_discord")],
+        [InlineKeyboardButton("📢 Пересилання", callback_data="help_forwarding")],
+        [InlineKeyboardButton("⚙️ Налаштування", callback_data="help_settings")],
+        [InlineKeyboardButton("❓ Часті питання", callback_data="help_faq")],
+        [InlineKeyboardButton("📞 Підтримка", callback_data="help_support")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Створити клавіатуру налаштувань"""
+    keyboard = [
+        [InlineKeyboardButton("🔔 Сповіщення", callback_data="settings_notifications")],
+        [InlineKeyboardButton("⏰ Інтервали моніторингу", callback_data="settings_intervals")],
+        [InlineKeyboardButton("🎨 Тема інтерфейсу", callback_data="settings_theme")],
+        [InlineKeyboardButton("🌐 Мова", callback_data="settings_language")],
+        [InlineKeyboardButton("🔒 Безпека", callback_data="settings_security")],
+        [InlineKeyboardButton("📊 Експорт даних", callback_data="settings_export")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def get_diagnostics_keyboard() -> InlineKeyboardMarkup:
     """Створити клавіатуру діагностики"""
     keyboard = [
@@ -570,12 +813,15 @@ def get_diagnostics_keyboard() -> InlineKeyboardMarkup:
 def get_admin_panel_keyboard() -> InlineKeyboardMarkup:
     """Створити клавіатуру адміністративної панелі"""
     keyboard = [
-        [InlineKeyboardButton("👥 Користувачі", callback_data="admin_users")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton("🔧 Система", callback_data="admin_system")],
+        [InlineKeyboardButton("👥 Управління користувачами", callback_data="admin_users")],
+        [InlineKeyboardButton("📊 Статистика та аналітика", callback_data="admin_stats")],
+        [InlineKeyboardButton("🔧 Системне управління", callback_data="admin_system")],
         [InlineKeyboardButton("📋 Всі проекти", callback_data="admin_all_projects")],
-        [InlineKeyboardButton("➕ Створити проект для користувача", callback_data="admin_create_for_user")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]
+        [InlineKeyboardButton("➕ Створити проект", callback_data="admin_create_for_user")],
+        [InlineKeyboardButton("🔍 Пошук та фільтри", callback_data="admin_search")],
+        [InlineKeyboardButton("📈 Моніторинг", callback_data="admin_monitoring")],
+        [InlineKeyboardButton("⚙️ Налаштування", callback_data="admin_settings")],
+        [InlineKeyboardButton("⬅️ Головне меню", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -583,15 +829,16 @@ def get_admin_users_keyboard() -> InlineKeyboardMarkup:
     """Створити клавіатуру управління користувачами"""
     keyboard = [
         [InlineKeyboardButton("👥 Список користувачів", callback_data="admin_list_users")],
+        [InlineKeyboardButton("📊 Статистика користувачів", callback_data="admin_user_stats")],
         [InlineKeyboardButton("➕ Додати користувача", callback_data="admin_add_user")],
-        [InlineKeyboardButton("👑 Додати адміна", callback_data="admin_add_admin")],
+        [InlineKeyboardButton("👑 Додати адміністратора", callback_data="admin_add_admin")],
         [InlineKeyboardButton("🔍 Пошук користувача", callback_data="admin_search_user")],
-        [InlineKeyboardButton("🗑️ Видалити користувача", callback_data="admin_delete_user")],
         [InlineKeyboardButton("🔄 Змінити роль", callback_data="admin_change_role")],
         [InlineKeyboardButton("🔐 Скинути пароль", callback_data="admin_reset_password")],
-        [InlineKeyboardButton("🔁 Пересилання (користувач)", callback_data="admin_forward")],
-        [InlineKeyboardButton("📊 Статистика користувачів", callback_data="admin_user_stats")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]
+        [InlineKeyboardButton("🔁 Налаштування пересилання", callback_data="admin_forward")],
+        [InlineKeyboardButton("🗑️ Видалити користувача", callback_data="admin_delete_user")],
+        [InlineKeyboardButton("📈 Активність користувачів", callback_data="admin_user_activity")],
+        [InlineKeyboardButton("⬅️ Назад до адмін панелі", callback_data="admin_panel")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -618,10 +865,65 @@ def get_admin_system_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Статистика системи", callback_data="admin_system_stats")],
         [InlineKeyboardButton("📋 Логи системи", callback_data="admin_system_logs")],
+        [InlineKeyboardButton("💾 Бекап та відновлення", callback_data="admin_backup_restore")],
         [InlineKeyboardButton("🔄 Очистити сесії", callback_data="admin_cleanup_sessions")],
-        [InlineKeyboardButton("💾 Створити бекап", callback_data="admin_create_backup")],
+        [InlineKeyboardButton("🧹 Очистити кеш", callback_data="admin_clear_cache")],
+        [InlineKeyboardButton("🔧 Налаштування системи", callback_data="admin_system_config")],
         [InlineKeyboardButton("⚠️ Скинути систему", callback_data="admin_reset_system")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]
+        [InlineKeyboardButton("⬅️ Назад до адмін панелі", callback_data="admin_panel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_search_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру пошуку та фільтрів"""
+    keyboard = [
+        [InlineKeyboardButton("🔍 Пошук користувачів", callback_data="admin_search_users")],
+        [InlineKeyboardButton("📋 Пошук проектів", callback_data="admin_search_projects")],
+        [InlineKeyboardButton("📊 Фільтри статистики", callback_data="admin_stats_filters")],
+        [InlineKeyboardButton("📅 Фільтр за датою", callback_data="admin_date_filter")],
+        [InlineKeyboardButton("🏷️ Фільтр за тегами", callback_data="admin_tag_filter")],
+        [InlineKeyboardButton("📈 Розширена аналітика", callback_data="admin_advanced_analytics")],
+        [InlineKeyboardButton("⬅️ Назад до адмін панелі", callback_data="admin_panel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_monitoring_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру моніторингу"""
+    keyboard = [
+        [InlineKeyboardButton("📈 Статус моніторингу", callback_data="admin_monitoring_status")],
+        [InlineKeyboardButton("🔔 Налаштування сповіщень", callback_data="admin_notifications")],
+        [InlineKeyboardButton("⏰ Розклад моніторингу", callback_data="admin_monitoring_schedule")],
+        [InlineKeyboardButton("📊 Логи моніторингу", callback_data="admin_monitoring_logs")],
+        [InlineKeyboardButton("🔄 Перезапустити моніторинг", callback_data="admin_restart_monitoring")],
+        [InlineKeyboardButton("⚡ Швидкість відповіді", callback_data="admin_response_time")],
+        [InlineKeyboardButton("⬅️ Назад до адмін панелі", callback_data="admin_panel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_settings_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру налаштувань"""
+    keyboard = [
+        [InlineKeyboardButton("🔐 Налаштування безпеки", callback_data="admin_security_settings")],
+        [InlineKeyboardButton("🎨 Налаштування інтерфейсу", callback_data="admin_ui_settings")],
+        [InlineKeyboardButton("📱 Налаштування бота", callback_data="admin_bot_settings")],
+        [InlineKeyboardButton("🌐 Налаштування мережі", callback_data="admin_network_settings")],
+        [InlineKeyboardButton("💾 Налаштування збереження", callback_data="admin_storage_settings")],
+        [InlineKeyboardButton("🔧 Розширені налаштування", callback_data="admin_advanced_settings")],
+        [InlineKeyboardButton("⬅️ Назад до адмін панелі", callback_data="admin_panel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_stats_keyboard() -> InlineKeyboardMarkup:
+    """Створити клавіатуру статистики"""
+    keyboard = [
+        [InlineKeyboardButton("📊 Загальна статистика", callback_data="admin_general_stats")],
+        [InlineKeyboardButton("👥 Статистика користувачів", callback_data="admin_user_stats")],
+        [InlineKeyboardButton("📋 Статистика проектів", callback_data="admin_project_stats")],
+        [InlineKeyboardButton("📈 Графіки та діаграми", callback_data="admin_charts")],
+        [InlineKeyboardButton("📅 Статистика за період", callback_data="admin_period_stats")],
+        [InlineKeyboardButton("🔍 Детальна аналітика", callback_data="admin_detailed_analytics")],
+        [InlineKeyboardButton("📤 Експорт даних", callback_data="admin_export_data")],
+        [InlineKeyboardButton("⬅️ Назад до адмін панелі", callback_data="admin_panel")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -631,10 +933,15 @@ def escape_markdown(text: str) -> str:
         return ""
     return str(text).replace('*', '\\*').replace('_', '\\_').replace('`', '\\`').replace('[', '\\[').replace(']', '\\]')
 
-def extract_twitter_username(url: str) -> str:
-    """Витягти username з Twitter URL"""
+def extract_twitter_username(url: str) -> Optional[str]:
+    """Витягти username з Twitter URL або просто username"""
     try:
-        # Підтримуємо різні формати URL
+        if not url:
+            return None
+            
+        url = url.strip()
+        
+        # Якщо це повний URL з twitter.com або x.com
         if 'twitter.com' in url or 'x.com' in url:
             # Видаляємо протокол
             url = url.replace('https://', '').replace('http://', '')
@@ -656,13 +963,24 @@ def extract_twitter_username(url: str) -> str:
             
             return username if username else None
             
+        # Якщо це просто username (без URL)
+        elif url and not url.startswith('http') and not '/' in url:
+            # Видаляємо @ якщо є
+            username = url.replace('@', '').strip()
+            # Перевіряємо що це валідний username (тільки букви, цифри, підкреслення)
+            if username and username.replace('_', '').replace('-', '').isalnum():
+                return username
+            
         return None
     except Exception as e:
-        logger.error(f"Помилка витягування Twitter username: {e}")
+        logger.error(f"Помилка витягування Twitter username з '{url}': {e}")
         return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник команди /start"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     
@@ -672,33 +990,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         access_manager.update_session_activity(user_id)
         # Перевіряємо статус Selenium моніторингу
         selenium_status = "🚀 Активний" if selenium_twitter_monitor and selenium_twitter_monitor.monitoring_active else "⏸️ Неактивний"
-        selenium_accounts = len(selenium_twitter_monitor.monitoring_accounts) if selenium_twitter_monitor else 0
+        selenium_count = len(selenium_twitter_monitor.monitoring_accounts) if selenium_twitter_monitor else 0
         
         # Отримуємо роль користувача
         user_role = access_manager.get_user_role(user_id)
         role_emoji = "👑" if user_role == "admin" else "👤"
         role_text = "Адміністратор" if user_role == "admin" else "Користувач"
         
-        await update.message.reply_text(
-            f"👋 Привіт, {username}!\n\n"
+        welcome_text = format_success_message(
+            f"Привіт, {username}!",
             f"{role_emoji} **Роль:** {role_text}\n"
             "✅ Ви авторизовані в системі.\n\n"
             f"🚀 **Selenium Twitter моніторинг:** {selenium_status}\n"
-            f"📊 **Акаунтів для моніторингу:** {selenium_accounts}\n\n"
-            "Використовуйте меню нижче для навігації.",
+            f"📊 **Акаунтів для моніторингу:** {selenium_count}",
+            "Використовуйте меню нижче для навігації по всіх функціях бота."
+        )
+        # Видаляємо команду /start для чистоти
+        if update.message:
+            asyncio.create_task(safe_delete_message(context, update.effective_chat.id, update.message.message_id))
+        
+        # Відправляємо головне меню та зберігаємо його ID
+        menu_message = await update.message.reply_text(
+            welcome_text,
             reply_markup=get_main_menu_keyboard(user_id),
-            parse_mode='Markdown'
         )
+        main_menu_messages[user_id] = menu_message.message_id
     else:
-        await update.message.reply_text(
-            f"👋 Привіт, {username}!\n\n"
-            "🔐 Для використання бота необхідна авторизація\n\n"
-            "Використовуйте команду /login для входу в систему.\n"
-            "Якщо ви новий користувач, зверніться до адміністратора."
+        auth_text = format_info_message(
+            f"Привіт, {username}!",
+            "🔐 Для використання бота необхідна авторизація",
+            "• Використовуйте команду /login для входу в систему\n"
+            "• Якщо ви новий користувач, зверніться до адміністратора\n"
+            "• Після авторизації ви отримаєте доступ до всіх функцій"
         )
+        await update.message.reply_text(auth_text, )
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для авторизації користувача"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     
@@ -708,7 +1039,6 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         access_manager.update_session_activity(user_id)
         await update.message.reply_text(
             "✅ Ви вже авторизовані в системі!",
-            parse_mode='Markdown'
         )
         return
     
@@ -719,7 +1049,6 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "❌ **Користувач не знайдений!**\n\n"
             "Ваш Telegram ID не зареєстрований в системі.\n"
             "Зверніться до адміністратора для реєстрації.",
-            parse_mode='Markdown'
         )
         return
     
@@ -729,22 +1058,27 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "❌ **Доступ заблоковано!**\n\n"
             "Ваш акаунт деактивований.\n"
             "Зверніться до адміністратора.",
-            parse_mode='Markdown'
         )
         return
     
     # Запитуємо пароль
     await update.message.reply_text(
-        "🔐 **Введіть пароль для авторизації:**\n\n"
+        "🔐 Введіть пароль для авторизації:\n\n"
         "Надішліть пароль повідомленням.",
-        parse_mode='Markdown'
     )
+    
+    # Видаляємо команду /login для чистоти
+    if update.message:
+        asyncio.create_task(safe_delete_message(context, update.effective_chat.id, update.message.message_id))
     
     # Встановлюємо стан очікування паролю
     waiting_for_password[user_id] = True
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для виходу з системи"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     
     if access_manager.is_authorized(user_id):
@@ -752,16 +1086,17 @@ async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             "👋 **Ви успішно вийшли з системи!**\n\n"
             "Для повторного входу використовуйте команду /login",
-            parse_mode='Markdown'
         )
     else:
         await update.message.reply_text(
             "ℹ️ Ви не авторизовані в системі.",
-            parse_mode='Markdown'
         )
 
 async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для реєстрації нового користувача (тільки для адміністратора)"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     
     # Перевіряємо чи користувач має права адміністратора
@@ -769,7 +1104,6 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(
             "❌ **Доступ заборонено!**\n\n"
             "Тільки адміністратор може реєструвати нових користувачів.",
-            parse_mode='Markdown'
         )
         return
     
@@ -778,7 +1112,6 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "📝 **Реєстрація нового користувача**\n\n"
             "Використання: /register <telegram_id> <username> [password]\n\n"
             "Приклад: /register 123456789 JohnDoe mypassword",
-            parse_mode='Markdown'
         )
         return
     
@@ -788,7 +1121,7 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         password = context.args[2] if len(context.args) > 2 else None
         
         # Додаємо користувача
-        new_user_id = access_manager.add_user(target_telegram_id, username, password)
+        new_user_id = access_manager.add_user(target_telegram_id, username or "Unknown", password or "")
         
         if new_user_id:
             await update.message.reply_text(
@@ -797,12 +1130,10 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"• Username: {username}\n"
                 f"• User ID: {new_user_id}\n"
                 f"• Пароль: {password or 'за замовчуванням'}",
-                parse_mode='Markdown'
             )
         else:
             await update.message.reply_text(
                 "❌ Помилка реєстрації користувача.",
-                parse_mode='Markdown'
             )
             
     except ValueError:
@@ -810,18 +1141,16 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "❌ **Неправильний формат!**\n\n"
             "Telegram ID повинен бути числом.\n"
             "Приклад: /register 123456789 JohnDoe",
-            parse_mode='Markdown'
         )
     except Exception as e:
         await update.message.reply_text(
             f"❌ Помилка реєстрації: {str(e)}",
-            parse_mode='Markdown'
         )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник повідомлень"""
     # Перевіряємо чи це повідомлення від користувача (не від каналу)
-    if not update.effective_user:
+    if not update.effective_user or not update.message:
         return
     
     # Перевіряємо чи це не канал
@@ -851,23 +1180,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     # Якщо користувач очікує введення пароля для нової системи
     if user_id in waiting_for_password:
+        # ВАЖЛИВО: Негайно видаляємо повідомлення з паролем для безпеки
+        if update.message:
+            asyncio.create_task(safe_delete_message(context, update.effective_chat.id, update.message.message_id))
+        
         # Спробуємо авторизувати через нову систему
-        if access_manager.authenticate_user(user_id, message_text):
+        if message_text and access_manager.authenticate_user(user_id, message_text):
             del waiting_for_password[user_id]
             # Оновлюємо активність сесії
             access_manager.update_session_activity(user_id)
-            await update.message.reply_text(
-                "✅ **Авторизація успішна!**\n\n"
-                "Оберіть дію з меню нижче:",
+            success_text = format_success_message(
+                "Авторизація успішна!",
+                "Ви успішно увійшли в систему та отримали доступ до всіх функцій бота.",
+                "Оберіть дію з меню нижче для початку роботи."
+            )
+            # Відправляємо головне меню та зберігаємо його ID
+            menu_message = await update.message.reply_text(
+                success_text,
                 reply_markup=get_main_menu_keyboard(user_id),
-                parse_mode='Markdown'
             )
+            main_menu_messages[user_id] = menu_message.message_id
         else:
-            await update.message.reply_text(
-                "❌ **Неправильний пароль!**\n\n"
-                "Спробуйте ще раз або зверніться до адміністратора.",
-                parse_mode='Markdown'
+            error_text = format_error_message(
+                "Неправильний пароль!",
+                "Введений пароль не підходить для вашого акаунту.",
+                "Спробуйте ще раз або зверніться до адміністратора для отримання правильного паролю."
             )
+            await update.message.reply_text(error_text, )
         return
     
     # Перевіряємо авторизацію для інших повідомлень через нову систему
@@ -876,7 +1215,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "🔐 **Доступ обмежено!**\n\n"
             "Для використання бота необхідна авторизація.\n"
             "Використовуйте команду /login для входу в систему.",
-            parse_mode='Markdown'
         )
         return
     
@@ -917,19 +1255,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await handle_admin_system_reset(update, context)
         return
     
+    # Автоматично видаляємо всі текстові повідомлення користувача для чистоти чату
+    if update.message and not message_text.startswith('/'):
+        asyncio.create_task(safe_delete_message(context, update.effective_chat.id, update.message.message_id))
+    
     # Обробляємо команди
-    if message_text.startswith('/'):
+    if message_text and message_text.startswith('/'):
+        # Видаляємо команди також для чистоти
+        if update.message:
+            asyncio.create_task(safe_delete_message(context, update.effective_chat.id, update.message.message_id))
         await handle_command(update, context, message_text)
     else:
-        await update.message.reply_text(
-            f"Ви написали: {message_text}\n"
-            f"Час до закінчення сесії: {security_manager.get_session_time_left(user_id)} секунд\n\n"
-            f"Використайте меню для навігації:",
-            reply_markup=get_main_menu_keyboard(user_id)
-        )
+        # Для звичайних повідомлень показуємо підказку через головне меню
+        if user_id in main_menu_messages:
+            try:
+                # Оновлюємо існуюче головне меню з підказкою
+                hint_text = format_info_message(
+                    "Використовуйте меню",
+                    f"Ваше повідомлення: \"{message_text[:50]}{'...' if len(message_text) > 50 else ''}\"",
+                    f"• Час до закінчення сесії: {security_manager.get_session_time_left(user_id)} секунд\n"
+                    "• Для навігації використовуйте кнопки меню нижче\n"
+                    "• Всі команди доступні через інтерфейс"
+                )
+                await context.bot.edit_message_text(
+                    text=hint_text,
+                    chat_id=update.effective_chat.id,
+                    message_id=main_menu_messages[user_id],
+                    reply_markup=get_main_menu_keyboard(user_id),
+                )
+            except Exception:
+                # Якщо не вдалося редагувати, створюємо нове меню
+                menu_message = await update.message.reply_text(
+                    format_info_message(
+                        "Використовуйте меню",
+                        "Для навігації використовуйте кнопки меню нижче",
+                        f"Час до закінчення сесії: {security_manager.get_session_time_left(user_id)} секунд"
+                    ),
+                    reply_markup=get_main_menu_keyboard(user_id),
+                )
+                main_menu_messages[user_id] = menu_message.message_id
+        else:
+            # Створюємо нове головне меню
+            menu_message = await update.message.reply_text(
+                format_info_message(
+                    "Використовуйте меню",
+                    "Для навігації використовуйте кнопки меню нижче",
+                    f"Час до закінчення сесії: {security_manager.get_session_time_left(user_id)} секунд"
+                ),
+                reply_markup=get_main_menu_keyboard(user_id),
+            )
+            main_menu_messages[user_id] = menu_message.message_id
 
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> None:
     """Обробник команд"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     
     if command == '/status':
@@ -955,6 +1336,9 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, com
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник callback запитів"""
+    if not update.callback_query or not update.effective_user:
+        return
+    
     query = update.callback_query
     await query.answer()
     
@@ -966,7 +1350,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "🔐 **Доступ обмежено!**\n\n"
             "Ваша сесія закінчилася. Для використання бота необхідна повторна авторизація.\n"
             "Використовуйте команду /login для входу в систему.",
-            parse_mode='Markdown'
         )
         return
     
@@ -984,10 +1367,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     
     callback_data = query.data
     
-    if callback_data == "main_menu":
+    # Перевіряємо, чи callback_data не є None
+    if callback_data is None:
         await query.edit_message_text(
-            "🏠 Головне меню\n\nОберіть дію:",
+            "❌ Помилка: некоректні дані callback",
             reply_markup=get_main_menu_keyboard(user_id)
+        )
+        return
+    
+    if callback_data == "main_menu":
+        # Оновлюємо ID головного меню
+        main_menu_messages[user_id] = query.message.message_id
+        
+        welcome_text = format_success_message(
+            "Головне меню",
+            "Оберіть дію з меню нижче:",
+            "Всі функції бота доступні через це меню."
+        )
+        await query.edit_message_text(
+            welcome_text,
+            reply_markup=get_main_menu_keyboard(user_id),
         )
     elif callback_data == "add_project":
         await query.edit_message_text(
@@ -995,9 +1394,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=get_platform_keyboard()
         )
     elif callback_data == "my_projects":
+        projects_text = format_info_message(
+            "Мої проекти",
+            "Управління вашими проектами моніторингу",
+            "Тут ви можете переглядати, додавати та видаляти свої проекти для моніторингу Twitter та Discord."
+        )
         await query.edit_message_text(
-            "📋 Управління проектами\n\nОберіть категорію:",
-            reply_markup=get_projects_menu_keyboard(user_id)
+            projects_text,
+            reply_markup=get_projects_menu_keyboard(user_id),
         )
     elif callback_data == "projects_menu":
         await query.edit_message_text(
@@ -1060,34 +1464,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "💬 Додавання проекту Discord\n\nВведіть назву проекту:"
         )
     elif callback_data == "help":
-        help_text = (
-            "❓ Допомога\n\n"
-            "📋 Доступні функції:\n"
-            "• Додавання проектів для моніторингу\n"
-            "• Підтримка Twitter/X та Discord\n"
-            "• Перегляд ваших проектів\n"
-            "• Автоматична безпека з паролем\n\n"
-            "🔐 Безпека:\n"
-            "• Сесія закінчується через 5 хвилин неактивності\n"
-            "• Для продовження потрібно ввести пароль\n\n"
-            "📝 Формат посилань:\n"
-            "• Twitter: https://twitter.com/username\n"
-            "• Discord: https://discord.com/channels/server_id/channel_id"
-        )
-        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
         await query.edit_message_text(
-            help_text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "❓ **Система допомоги**\n\n"
+            "Оберіть розділ для отримання детальної інформації:",
+            reply_markup=get_help_keyboard()
         )
     elif callback_data == "selenium_twitter":
         # Перевіряємо статус Selenium моніторингу
         selenium_status = "🚀 Активний" if selenium_twitter_monitor and selenium_twitter_monitor.monitoring_active else "⏸️ Неактивний"
-        selenium_accounts = len(selenium_twitter_monitor.monitoring_accounts) if selenium_twitter_monitor else 0
+        selenium_count = len(selenium_twitter_monitor.monitoring_accounts) if selenium_twitter_monitor else 0
         
         selenium_text = (
             "🐦 **Selenium Twitter Моніторинг**\n\n"
             f"📊 **Статус:** {selenium_status}\n"
-            f"👥 **Акаунтів:** {selenium_accounts}\n"
+            f"👥 **Акаунтів:** {selenium_count}\n"
             f"🔄 **Автозапуск:** ✅ Увімкнено\n\n"
             "🔧 **Доступні команди:**\n"
             "• `/selenium_auth` - Авторизація в Twitter\n"
@@ -1111,7 +1501,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             selenium_text,
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
         )
     elif callback_data.startswith("delete_selenium_"):
         username = callback_data.replace("delete_selenium_", "")
@@ -1131,7 +1520,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=get_selenium_accounts_keyboard()
             )
     elif callback_data.startswith("view_twitter_"):
-        project_id = callback_data.replace("view_twitter_", "")
+        project_id = int(callback_data.replace("view_twitter_", ""))
         project = project_manager.get_project_by_id(user_id, project_id)
         if project:
             text = f"🐦 **Twitter проект: {project['name']}**\n\n"
@@ -1147,10 +1536,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
             )
     elif callback_data.startswith("view_discord_"):
-        project_id = callback_data.replace("view_discord_", "")
+        project_id = int(callback_data.replace("view_discord_", ""))
         project = project_manager.get_project_by_id(user_id, project_id)
         if project:
             text = f"💬 **Discord проект: {project['name']}**\n\n"
@@ -1166,13 +1554,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
             )
     elif callback_data.startswith("view_selenium_"):
         username = callback_data.replace("view_selenium_", "")
         selenium_accounts = project_manager.get_selenium_accounts()
         if username in selenium_accounts:
-            account_data = selenium_accounts[username]
+            account_data = project_manager.data['selenium_accounts'][username]
             text = f"🚀 **Selenium Twitter: @{username}**\n\n"
             text += f"📅 **Додано:** {account_data.get('added_at', 'Невідомо')}\n"
             text += f"👤 **Додав:** {account_data.get('added_by', 'Невідомо')}\n"
@@ -1186,7 +1573,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
             )
     elif callback_data == "account_manager":
         # Показуємо менеджер акаунтів
@@ -1209,8 +1595,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if twitter_projects:
             text += "🐦 **Twitter/X акаунти:**\n"
             for i, project in enumerate(twitter_projects, 1):
-                username = extract_twitter_username(project['url'])
-                text += f"{i}. @{username} ({project['name']})\n"
+                project_username: Optional[str] = extract_twitter_username(project['url'])
+                if project_username:
+                    text += f"{i}. @{project_username} ({project['name']})\n"
             text += "\n"
         
         if discord_projects:
@@ -1230,7 +1617,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             text,
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
         )
     elif callback_data == "discord_history":
         # Перевіряємо чи є Discord проекти
@@ -1266,28 +1652,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         count = int(callback_data.split("_")[1])
         await handle_discord_history(update, context, count)
     elif callback_data == "settings":
-        stats = project_manager.get_statistics()
-        user_projects = project_manager.get_user_projects(user_id)
-        
-        settings_text = (
-            "⚙️ Налаштування\n\n"
-            f"🔐 Час до закінчення сесії: {security_manager.get_session_time_left(user_id)} секунд\n"
-            f"📊 Ваші проекти: {len(user_projects)}\n"
-            f"👥 Всього користувачів: {stats['total_users']}\n"
-            f"📋 Всього проектів: {stats['total_projects']}\n"
-            f"💬 Discord проектів: {stats['discord_projects']}\n"
-            f"🐦 Twitter проектів: {stats['twitter_projects']}\n"
-            f"📁 Розмір файлу даних: {stats['data_file_size']} байт\n"
-            f"🕒 Останнє оновлення: {stats['last_updated'][:19]}\n\n"
-            "Доступні налаштування:\n"
-            "• Зміна пароля\n"
-            "• Налаштування часу сесії\n"
-            "• Експорт даних"
-        )
-        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
         await query.edit_message_text(
-            settings_text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "⚙️ **Налаштування**\n\n"
+            "Налаштуйте бота під свої потреби:",
+            reply_markup=get_settings_keyboard(user_id)
         )
     elif callback_data == "forward_settings":
         forward_status = project_manager.get_forward_status(user_id)
@@ -1332,7 +1700,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "📝 Встановлення каналу для пересилання\n\n"
             "**Спосіб 1 - Автоматичне налаштування:**\n"
             "1. Додайте бота в канал як адміністратора\n"
-            "2. Пінгніть бота в каналі: @bot_username\n"
+            "2. Пінгніть бота в каналі: @parseryamatobot\n"
             "3. Бот автоматично налаштує канал\n\n"
             "**Спосіб 2 - Ручне налаштування:**\n"
             "Введіть ID каналу або username каналу:\n\n"
@@ -1451,7 +1819,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.send_message(
                     chat_id=forward_channel,
                     text=test_message,
-                    parse_mode='Markdown'
                 )
                 
                 result_text = f"✅ **Тест каналу пройшов успішно!**\n\n📺 Канал: `{forward_channel}`\n📤 Тестове повідомлення відправлено"
@@ -1555,7 +1922,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             
             # Перезапускаємо Discord моніторинг
             if discord_monitor:
-                discord_monitor.channels.clear()
+                discord_monitor.monitoring_channels.clear()
                 for user_id_str, projects in project_manager.data['projects'].items():
                     for project in projects:
                         if project['platform'] == 'discord':
@@ -1578,27 +1945,31 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if not project:
             await query.edit_message_text("❌ Проект не знайдено.", reply_markup=get_twitter_projects_keyboard(user_id))
             return
-        username = extract_twitter_username(project.get('url', ''))
+        removed_username: Optional[str] = extract_twitter_username(project.get('url', ''))
         if project_manager.remove_project(user_id, project_id):
+            # Синхронізуємо монітори після видалення
+            sync_monitors_with_projects()
+            
             # Зупиняємо моніторинг цього акаунта відразу
             try:
-                if twitter_monitor and username:
-                    twitter_monitor.remove_account(username)
+                if twitter_monitor and removed_username:
+                    twitter_monitor.remove_account(removed_username)
             except Exception:
                 pass
-            if selenium_twitter_monitor and username in getattr(selenium_twitter_monitor, 'monitoring_accounts', set()):
-                selenium_twitter_monitor.monitoring_accounts.discard(username)
-                if username in selenium_twitter_monitor.seen_tweets:
-                    del selenium_twitter_monitor.seen_tweets[username]
+            if selenium_twitter_monitor and removed_username and removed_username in getattr(selenium_twitter_monitor, 'monitoring_accounts', set()):
+                selenium_twitter_monitor.monitoring_accounts.discard(removed_username)
+                if removed_username in selenium_twitter_monitor.seen_tweets:
+                    del selenium_twitter_monitor.seen_tweets[removed_username]
             # Також приберемо із збережених Selenium акаунтів, якщо це був він
             try:
-                project_manager.remove_selenium_account(username)
+                if removed_username:
+                    project_manager.remove_selenium_account(removed_username)
             except Exception:
                 pass
             # Синхронізація після змін
             sync_monitors_with_projects()
             await query.edit_message_text(
-                f"✅ Twitter акаунт @{username} видалено та зупинено моніторинг.",
+                f"✅ Twitter акаунт @{removed_username or 'Unknown'} видалено та зупинено моніторинг.",
                 reply_markup=get_twitter_projects_keyboard(user_id)
             )
         else:
@@ -1615,6 +1986,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
         channel_id = extract_discord_channel_id(project.get('url', ''))
         if project_manager.remove_project(user_id, project_id):
+            # Синхронізуємо монітори після видалення
+            sync_monitors_with_projects()
+            
             # Зупиняємо моніторинг цього каналу відразу
             if discord_monitor and channel_id in getattr(discord_monitor, 'monitoring_channels', set()):
                 discord_monitor.monitoring_channels.discard(channel_id)
@@ -1643,8 +2017,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         await query.edit_message_text(
             "👑 **Адміністративна панель**\n\n"
-            "Оберіть розділ для управління:",
-            reply_markup=get_admin_panel_keyboard()
+            "🎯 **Добро пожаловать в центр управления!**\n\n"
+            "📊 **Доступные разделы:**\n"
+            "• 👥 Управление пользователями\n"
+            "• 📊 Статистика и аналитика\n"
+            "• 🔧 Системное управление\n"
+            "• 📋 Просмотр всех проектов\n"
+            "• 🔍 Поиск и фильтры\n"
+            "• 📈 Мониторинг системы\n"
+            "• ⚙️ Настройки\n\n"
+            "Выберите нужный раздел для работы:",
+            reply_markup=get_admin_panel_keyboard(),
         )
     elif callback_data == "admin_users":
         if not access_manager.is_admin(user_id):
@@ -1656,8 +2039,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             
         await query.edit_message_text(
             "👥 **Управління користувачами**\n\n"
-            "Оберіть дію:",
-            reply_markup=get_admin_users_keyboard()
+            "🎯 **Центр управления пользователями**\n\n"
+            "📋 **Доступные действия:**\n"
+            "• 👥 Просмотр списка пользователей\n"
+            "• 📊 Статистика пользователей\n"
+            "• ➕ Добавление новых пользователей\n"
+            "• 👑 Создание администраторов\n"
+            "• 🔍 Поиск пользователей\n"
+            "• 🔄 Изменение ролей\n"
+            "• 🔐 Сброс паролей\n"
+            "• 🔁 Настройка пересылки\n"
+            "• 🗑️ Удаление пользователей\n"
+            "• 📈 Активность пользователей\n\n"
+            "Выберите нужное действие:",
+            reply_markup=get_admin_users_keyboard(),
         )
     elif callback_data == "admin_create_for_user":
         if not access_manager.is_admin(user_id):
@@ -1988,6 +2383,132 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"❌ **Помилка отримання статистики**\n\n{str(e)}",
                 reply_markup=get_admin_users_keyboard()
             )
+    
+    # Нові обробники для статистики
+    elif callback_data == "admin_general_stats":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            user_stats = access_manager.get_user_statistics()
+            system_stats = access_manager.get_system_statistics()
+            
+            stats_text = (
+                f"📊 **Загальна статистика системи**\n\n"
+                f"👥 **Користувачі:**\n"
+                f"• Всього користувачів: {user_stats['total_users']}\n"
+                f"• Активних: {user_stats['active_users']}\n"
+                f"• Адміністраторів: {user_stats['admin_users']}\n"
+                f"• Звичайних: {user_stats['regular_users']}\n\n"
+                f"📋 **Проекти:**\n"
+                f"• Всього проектів: {system_stats.get('total_projects', 0)}\n"
+                f"• Активних: {system_stats.get('active_projects', 0)}\n\n"
+                f"🟢 **Активність:**\n"
+                f"• Онлайн зараз: {user_stats['online_users']}\n"
+                f"• Входили за 24 год: {user_stats['recent_logins']}\n"
+                f"• Активних сесій: {system_stats.get('active_sessions', 0)}\n\n"
+                f"💾 **Система:**\n"
+                f"• Время работы: {system_stats.get('uptime', 'N/A')}\n"
+                f"• Версия: 2.0 Enhanced"
+            )
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=get_admin_stats_keyboard(),
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання статистики**\n\n{str(e)}",
+                reply_markup=get_admin_stats_keyboard()
+            )
+    
+    elif callback_data == "admin_project_stats":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            all_projects = project_manager.get_all_projects(user_id)
+            twitter_projects = [p for projects in all_projects.values() for p in projects if p.get('platform') == 'twitter']
+            discord_projects = [p for projects in all_projects.values() for p in projects if p.get('platform') == 'discord']
+            
+            stats_text = (
+                f"📋 **Статистика проектів**\n\n"
+                f"📊 **Загальна статистика:**\n"
+                f"• Всього проектів: {sum(len(projects) for projects in all_projects.values())}\n"
+                f"• Twitter проектів: {len(twitter_projects)}\n"
+                f"• Discord проектів: {len(discord_projects)}\n\n"
+                f"🐦 **Twitter проекти:**\n"
+                f"• Активних: {len([p for p in twitter_projects if p.get('active', False)])}\n"
+                f"• Неактивних: {len([p for p in twitter_projects if not p.get('active', False)])}\n\n"
+                f"💬 **Discord проекти:**\n"
+                f"• Активних: {len([p for p in discord_projects if p.get('active', False)])}\n"
+                f"• Неактивних: {len([p for p in discord_projects if not p.get('active', False)])}\n\n"
+                f"📈 **Популярні платформи:**\n"
+                f"• Twitter: {len(twitter_projects)} проектів\n"
+                f"• Discord: {len(discord_projects)} проектів"
+            )
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=get_admin_stats_keyboard(),
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання статистики проектів**\n\n{str(e)}",
+                reply_markup=get_admin_stats_keyboard()
+            )
+    
+    elif callback_data == "admin_charts":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "📈 **Графіки та діаграми**\n\n"
+            "🎯 **Візуальна аналітика**\n\n"
+            "📊 **Доступні графіки:**\n"
+            "• 📈 Графік активності користувачів\n"
+            "• 📊 Діаграма розподілу проектів\n"
+            "• 📅 Графік створення проектів\n"
+            "• 🔄 Графік активності моніторингу\n"
+            "• 📱 Статистика платформ\n\n"
+            "⚠️ **Примітка:** Графіки будуть додані в наступних версіях\n"
+            "Поки що доступна текстова статистика.",
+            reply_markup=get_admin_stats_keyboard(),
+        )
+    
+    elif callback_data == "admin_export_data":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "📤 **Експорт даних**\n\n"
+            "🎯 **Експорт системних даних**\n\n"
+            "📋 **Доступні формати:**\n"
+            "• 📊 Excel файл (.xlsx)\n"
+            "• 📄 CSV файл (.csv)\n"
+            "• 📋 JSON файл (.json)\n"
+            "• 📝 Текстовий файл (.txt)\n\n"
+            "⚠️ **Примітка:** Функція експорту буде додана в наступних версіях\n"
+            "Поки що дані доступні через адмін панель.",
+            reply_markup=get_admin_stats_keyboard(),
+        )
+    
     elif callback_data == "admin_system_stats":
         if not access_manager.is_admin(user_id):
             await query.edit_message_text(
@@ -2135,6 +2656,863 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardButton("❌ Скасувати", callback_data="admin_system")
             ]])
         )
+    
+    # Обробники для моніторингу
+    elif callback_data == "admin_monitoring_status":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            # Отримуємо статус моніторингу
+            discord_status = "🟢 Активний" if discord_monitor else "🔴 Неактивний"
+            twitter_status = "🟢 Активний" if twitter_monitor else "🔴 Неактивний"
+            selenium_status = "🟢 Активний" if selenium_twitter_monitor else "🔴 Неактивний"
+            
+            status_text = (
+                f"📈 **Статус моніторингу**\n\n"
+                f"🎯 **Поточний стан системи:**\n\n"
+                f"💬 **Discord моніторинг:**\n"
+                f"• Статус: {discord_status}\n"
+                f"• Авторизація: {'✅ Налаштована' if DISCORD_AUTHORIZATION else '❌ Не налаштована'}\n\n"
+                f"🐦 **Twitter моніторинг:**\n"
+                f"• Статус: {twitter_status}\n"
+                f"• Авторизація: {'✅ Налаштована' if TWITTER_AUTH_TOKEN else '❌ Не налаштована'}\n\n"
+                f"🔧 **Selenium Twitter:**\n"
+                f"• Статус: {selenium_status}\n"
+                f"• Профіль браузера: {'✅ Налаштований' if os.path.exists('browser_profile') else '❌ Не налаштований'}\n\n"
+                f"⏰ **Остання перевірка:** {datetime.now().strftime('%H:%M:%S')}\n"
+                f"🔄 **Інтервал перевірки:** {MONITORING_INTERVAL} секунд"
+            )
+            
+            await query.edit_message_text(
+                status_text,
+                reply_markup=get_admin_monitoring_keyboard(),
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання статусу**\n\n{str(e)}",
+                reply_markup=get_admin_monitoring_keyboard()
+            )
+    
+    elif callback_data == "admin_notifications":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "🔔 **Налаштування сповіщень**\n\n"
+            "🎯 **Центр уведомлений**\n\n"
+            "📋 **Доступні налаштування:**\n"
+            "• 📧 Email сповіщення\n"
+            "• 📱 Telegram сповіщення\n"
+            "• 🔔 Discord сповіщення\n"
+            "• ⚠️ Сповіщення про помилки\n"
+            "• 📊 Звіти про активність\n"
+            "• 🚨 Критичні сповіщення\n\n"
+            "⚠️ **Примітка:** Налаштування сповіщень будуть додані в наступних версіях",
+            reply_markup=get_admin_monitoring_keyboard(),
+        )
+    
+    elif callback_data == "admin_restart_monitoring":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "🔄 **Перезапуск моніторингу**\n\n"
+            "🎯 **Перезапуск системи моніторингу**\n\n"
+            "📋 **Що буде перезапущено:**\n"
+            "• Discord моніторинг\n"
+            "• Twitter моніторинг\n"
+            "• Selenium Twitter\n"
+            "• Всі активні сесії\n\n"
+            "⚠️ **Примітка:** Функція перезапуску буде додана в наступних версіях\n"
+            "Поки що перезапустіть бот вручну.",
+            reply_markup=get_admin_monitoring_keyboard(),
+        )
+    
+    # Додаткові адміністративні обробники
+    elif callback_data == "admin_backup_restore":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Бекап та відновлення",
+                "Управління резервними копіями системи",
+                "⚠️ Функція бекапу буде додана в наступних версіях.\n"
+                "Поки що дані зберігаються в файлах data.json та projects.json"
+            ),
+            reply_markup=get_admin_system_keyboard()
+        )
+    
+    elif callback_data == "admin_clear_cache":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            # Очищуємо кеш (глобальні змінні)
+            global global_sent_tweets
+            global_sent_tweets.clear()
+            
+            await query.edit_message_text(
+                format_success_message(
+                    "Кеш очищено",
+                    "Всі тимчасові дані успішно видалено",
+                    "Кеш відправлених твітів очищено. Система працюватиме швидше."
+                ),
+                reply_markup=get_admin_system_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                format_error_message("Помилка очищення кешу", str(e)),
+                reply_markup=get_admin_system_keyboard()
+            )
+    
+    elif callback_data == "admin_system_config":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        config_text = format_info_message(
+            "Налаштування системи",
+            "Поточні налаштування бота",
+            f"🔧 Конфігурація:\n"
+            f"• Тайм-аут сесії: {SECURITY_TIMEOUT} секунд\n"
+            f"• Інтервал Discord: {MONITORING_INTERVAL} секунд\n"
+            f"• Інтервал Twitter: {TWITTER_MONITORING_INTERVAL} секунд\n"
+            f"• Активних сесій: {len(access_manager.user_sessions)}\n\n"
+            f"⚠️ Зміна налаштувань буде додана в наступних версіях"
+        )
+        
+        await query.edit_message_text(
+            config_text,
+            reply_markup=get_admin_system_keyboard()
+        )
+    
+    # Обробники пошуку
+    elif callback_data == "admin_search_users":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Пошук користувачів",
+                "Функція пошуку користувачів",
+                "⚠️ Детальний пошук буде додано в наступних версіях.\n"
+                "Поки що використовуйте 'Список користувачів' для перегляду всіх користувачів."
+            ),
+            reply_markup=get_admin_search_keyboard()
+        )
+    
+    elif callback_data == "admin_search_projects":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Пошук проектів",
+                "Функція пошуку проектів",
+                "⚠️ Детальний пошук буде додано в наступних версіях.\n"
+                "Поки що використовуйте 'Всі проекти' для перегляду всіх проектів."
+            ),
+            reply_markup=get_admin_search_keyboard()
+        )
+    
+    # Обробники для налаштувань
+    elif callback_data == "admin_security_settings":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "🔐 **Налаштування безпеки**\n\n"
+            "🎯 **Центр безпеки**\n\n"
+            "📋 **Доступні налаштування:**\n"
+            "• 🔑 Налаштування паролів\n"
+            "• ⏰ Таймаути сесій\n"
+            "• 🚫 Блокування користувачів\n"
+            "• 📝 Логи безпеки\n"
+            "• 🔒 Шифрування даних\n"
+            "• 🛡️ Захист від атак\n\n"
+            "⚠️ **Примітка:** Розширені налаштування безпеки будуть додані в наступних версіях",
+            reply_markup=get_admin_settings_keyboard(),
+        )
+    
+    elif callback_data == "admin_ui_settings":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "🎨 **Налаштування інтерфейсу**\n\n"
+            "🎯 **Центр налаштувань UI**\n\n"
+            "📋 **Доступні налаштування:**\n"
+            "• 🎨 Теми інтерфейсу\n"
+            "• 📱 Розмір кнопок\n"
+            "• 🌍 Мова інтерфейсу\n"
+            "• 📊 Стиль статистики\n"
+            "• 🔔 Стиль сповіщень\n"
+            "• 📋 Макет меню\n\n"
+            "⚠️ **Примітка:** Налаштування інтерфейсу будуть додані в наступних версіях",
+            reply_markup=get_admin_settings_keyboard(),
+        )
+    
+    # Обробники нових меню
+    elif callback_data == "quick_actions":
+        await query.edit_message_text(
+            "⚡ **Швидкі дії**\n\n"
+            "Оберіть дію для швидкого виконання:",
+            reply_markup=get_quick_actions_keyboard(user_id)
+        )
+    elif callback_data == "about":
+        about_text = (
+            "ℹ️ **Про бота**\n\n"
+            "🤖 **Telegram Monitor Bot**\n"
+            "Версія: 2.0\n\n"
+            "📋 **Функції:**\n"
+            "• Моніторинг Twitter/X акаунтів\n"
+            "• Моніторинг Discord каналів\n"
+            "• Автоматичне пересилання повідомлень\n"
+            "• Система безпеки з авторизацією\n"
+            "• Адміністративна панель\n"
+            "• Selenium для обходу обмежень\n\n"
+            "👨‍💻 **Розробник:** megymin\n"
+            "📅 **Останнє оновлення:** 2025"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
+        await query.edit_message_text(
+            about_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    # Обробники швидких дій
+    elif callback_data == "start_all_monitors":
+        try:
+            # Запускаємо всі монітори через автоматичну функцію
+            auto_start_monitoring()
+            
+            await query.edit_message_text(
+                "🚀 **Всі монітори запущено!**\n\n"
+                "✅ Twitter API моніторинг активний\n"
+                "✅ Selenium Twitter моніторинг активний\n"
+                "✅ Discord моніторинг активний\n"
+                "✅ Автоматичні сповіщення увімкнено",
+                reply_markup=get_quick_actions_keyboard(user_id)
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка запуску моніторів**\n\n{str(e)}",
+                reply_markup=get_quick_actions_keyboard(user_id)
+            )
+    elif callback_data == "stop_all_monitors":
+        try:
+            # Зупиняємо всі монітори
+            if selenium_twitter_monitor:
+                selenium_twitter_monitor.monitoring_active = False
+            
+            # Зупиняємо Twitter API моніторинг
+            if twitter_monitor:
+                twitter_monitor.monitoring_active = False
+            
+            # Зупиняємо Discord моніторинг
+            if discord_monitor:
+                discord_monitor.monitoring_active = False
+            
+            await query.edit_message_text(
+                "⏹️ **Всі монітори зупинено!**\n\n"
+                "🔴 Twitter API моніторинг зупинено\n"
+                "🔴 Selenium Twitter моніторинг зупинено\n"
+                "🔴 Discord моніторинг зупинено\n"
+                "🔴 Автоматичні сповіщення вимкнено",
+                reply_markup=get_quick_actions_keyboard(user_id)
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка зупинки моніторів**\n\n{str(e)}",
+                reply_markup=get_quick_actions_keyboard(user_id)
+            )
+    elif callback_data == "quick_stats":
+        try:
+            stats = project_manager.get_statistics()
+            user_projects = project_manager.get_user_projects(user_id)
+            twitter_count = len([p for p in user_projects if p['platform'] == 'twitter'])
+            discord_count = len([p for p in user_projects if p['platform'] == 'discord'])
+            selenium_count = len(project_manager.get_selenium_accounts())
+            
+            quick_stats_text = (
+                "📊 **Швидка статистика**\n\n"
+                f"👤 **Ваші проекти:**\n"
+                f"• Twitter: {twitter_count}\n"
+                f"• Discord: {discord_count}\n"
+                f"• Selenium: {selenium_count}\n\n"
+                f"🌐 **Загальна статистика:**\n"
+                f"• Всього користувачів: {stats.get('total_users', 0)}\n"
+                f"• Всього проектів: {stats.get('total_projects', 0)}\n"
+                f"• Активних сесій: {len(access_manager.user_sessions)}"
+            )
+            
+            await query.edit_message_text(
+                quick_stats_text,
+                reply_markup=get_quick_actions_keyboard(user_id)
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка отримання статистики**\n\n{str(e)}",
+                reply_markup=get_quick_actions_keyboard(user_id)
+            )
+    elif callback_data == "recent_messages":
+        await query.edit_message_text(
+            "📝 **Останні повідомлення**\n\nОберіть кількість повідомлень для перегляду:",
+            reply_markup=get_history_count_keyboard()
+        )
+    elif callback_data == "refresh_data":
+        try:
+            project_manager.load_data()
+            sync_monitors_with_projects()
+            
+            await query.edit_message_text(
+                "🔄 **Дані оновлено!**\n\n"
+                "✅ Проекти перезавантажено\n"
+                "✅ Монітори синхронізовано\n"
+                "✅ Налаштування оновлено",
+                reply_markup=get_quick_actions_keyboard(user_id)
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ **Помилка оновлення даних**\n\n{str(e)}",
+                reply_markup=get_quick_actions_keyboard(user_id)
+            )
+    
+    # Обробники допомоги
+    elif callback_data == "help_getting_started":
+        help_text = (
+            "🚀 **Початок роботи**\n\n"
+            "**Крок 1:** Авторизуйтеся за допомогою /login\n"
+            "**Крок 2:** Створіть новий проект через меню\n"
+            "**Крок 3:** Додайте посилання на Twitter або Discord\n"
+            "**Крок 4:** Налаштуйте пересилання повідомлень\n"
+            "**Крок 5:** Запустіть моніторинг\n\n"
+            "💡 **Поради:**\n"
+            "• Використовуйте швидкі дії для зручності\n"
+            "• Перевіряйте діагностику при проблемах\n"
+            "• Налаштуйте автоматичне пересилання"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="help")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "help_twitter":
+        help_text = (
+            "🐦 **Twitter налаштування**\n\n"
+            "**Формат посилань:**\n"
+            "• https://twitter.com/username\n"
+            "• https://x.com/username\n\n"
+            "**Selenium моніторинг:**\n"
+            "• Обходить обмеження API\n"
+            "• Автоматичний запуск\n"
+            "• Підтримка зображень\n\n"
+            "**Команди:**\n"
+            "• /selenium_start - запустити\n"
+            "• /selenium_stop - зупинити\n"
+            "• /selenium_add username - додати акаунт"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="help")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "help_discord":
+        help_text = (
+            "💬 **Discord налаштування**\n\n"
+            "**Формат посилань:**\n"
+            "• https://discord.com/channels/server_id/channel_id\n\n"
+            "**Налаштування:**\n"
+            "• Потрібен AUTHORIZATION токен\n"
+            "• Встановіть в .env файлі\n"
+            "• Перевірте через діагностику\n\n"
+            "**Функції:**\n"
+            "• Моніторинг нових повідомлень\n"
+            "• Автоматичне пересилання\n"
+            "• Підтримка зображень та файлів"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="help")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "help_forwarding":
+        help_text = (
+            "📢 **Налаштування пересилання**\n\n"
+            "**Автоналаштування:**\n"
+            "• Додайте бота в канал як адміністратора\n"
+            "• Напишіть в каналі: @botusername ping\n"
+            "• Бот автоматично налаштує пересилання\n\n"
+            "**Ручне налаштування:**\n"
+            "• /forward_set_channel CHANNEL_ID\n"
+            "• /forward_on - увімкнути\n"
+            "• /forward_off - вимкнути\n\n"
+            "**Тестування:**\n"
+            "• /forward_test - відправити тестове повідомлення"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="help")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "help_faq":
+        help_text = (
+            "❓ **Часті питання**\n\n"
+            "**Q: Чому не працює Twitter моніторинг?**\n"
+            "A: Спробуйте Selenium моніторинг - він обходить обмеження API\n\n"
+            "**Q: Як налаштувати Discord?**\n"
+            "A: Потрібен AUTHORIZATION токен в .env файлі\n\n"
+            "**Q: Сесія постійно закінчується**\n"
+            "A: Сесія діє 5 хвилин. Використовуйте бота активно\n\n"
+            "**Q: Не отримую сповіщення**\n"
+            "A: Перевірте налаштування пересилання та права бота"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="help")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "help_support":
+        help_text = format_info_message(
+            "Підтримка",
+            "Технічна підтримка та допомога",
+            "• Використовуйте діагностику системи для перевірки стану\n"
+            "• Перевіряйте логи через адміністративну панель\n"
+            "• Перезапускайте монітори при необхідності\n"
+            "• Зверніться до адміністратора при серйозних проблемах"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="help")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    # Обробники налаштувань
+    elif callback_data == "settings_notifications":
+        settings_text = (
+            "🔔 **Налаштування сповіщень**\n\n"
+            "**Поточні налаштування:**\n"
+            "• Сповіщення про нові повідомлення: ✅ Увімкнено\n"
+            "• Сповіщення про помилки: ✅ Увімкнено\n"
+            "• Звукові сповіщення: ❌ Вимкнено\n\n"
+            "⚠️ **Примітка:** Детальні налаштування сповіщень будуть додані в наступних версіях"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]]
+        await query.edit_message_text(settings_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "settings_intervals":
+        settings_text = (
+            "⏰ **Інтервали моніторингу**\n\n"
+            f"**Поточні налаштування:**\n"
+            f"• Discord: {MONITORING_INTERVAL} секунд\n"
+            f"• Twitter: {TWITTER_MONITORING_INTERVAL} секунд\n"
+            f"• Selenium: 30 секунд\n\n"
+            "⚠️ **Примітка:** Зміна інтервалів буде додана в наступних версіях.\n"
+            "Поки що інтервали налаштовуються в config.py"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]]
+        await query.edit_message_text(settings_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "settings_theme":
+        settings_text = (
+            "🎨 **Тема інтерфейсу**\n\n"
+            "**Поточна тема:** Стандартна\n\n"
+            "**Доступні теми:**\n"
+            "• 🌟 Стандартна (поточна)\n"
+            "• 🌙 Темна (планується)\n"
+            "• 🌈 Кольорова (планується)\n\n"
+            "⚠️ **Примітка:** Вибір теми буде додано в наступних версіях"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]]
+        await query.edit_message_text(settings_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "settings_language":
+        settings_text = (
+            "🌐 **Налаштування мови**\n\n"
+            "**Поточна мова:** 🇺🇦 Українська\n\n"
+            "**Доступні мови:**\n"
+            "• 🇺🇦 Українська (поточна)\n"
+            "• 🇬🇧 English (планується)\n"
+            "• 🇷🇺 Русский (планується)\n\n"
+            "⚠️ **Примітка:** Багатомовність буде додана в наступних версіях"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]]
+        await query.edit_message_text(settings_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "settings_security":
+        session_time_left = security_manager.get_session_time_left(user_id) if security_manager else 0
+        settings_text = (
+            "🔒 **Налаштування безпеки**\n\n"
+            "**Поточні налаштування:**\n"
+            f"• Тайм-аут сесії: {SECURITY_TIMEOUT} секунд\n"
+            f"• Час до закінчення сесії: {session_time_left} секунд\n"
+            f"• Активних сесій: {len(access_manager.user_sessions)}\n\n"
+            "**Функції безпеки:**\n"
+            "• Автоматичне завершення сесії\n"
+            "• Авторизація за паролем\n"
+            "• Контроль доступу адміністраторів\n\n"
+            "⚠️ **Примітка:** Додаткові налаштування безпеки будуть додані пізніше"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]]
+        await query.edit_message_text(settings_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif callback_data == "settings_export":
+        try:
+            stats = project_manager.get_statistics()
+            user_projects = project_manager.get_user_projects(user_id)
+            
+            export_text = (
+                "📊 **Експорт даних**\n\n"
+                "**Ваші дані:**\n"
+                f"• Проекти: {len(user_projects)}\n"
+                f"• Twitter проекти: {len([p for p in user_projects if p['platform'] == 'twitter'])}\n"
+                f"• Discord проекти: {len([p for p in user_projects if p['platform'] == 'discord'])}\n\n"
+                "**Загальна статистика:**\n"
+                f"• Всього користувачів: {stats.get('total_users', 0)}\n"
+                f"• Всього проектів: {stats.get('total_projects', 0)}\n"
+                f"• Розмір файлу даних: {stats.get('data_file_size', 0)} байт\n\n"
+                "⚠️ **Примітка:** Функція експорту в файл буде додана пізніше"
+            )
+        except Exception as e:
+            export_text = f"❌ **Помилка отримання даних для експорту**\n\n{str(e)}"
+        
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]]
+        await query.edit_message_text(export_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    # Додаткові обробники для моніторингу
+    elif callback_data == "admin_monitoring_schedule":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Розклад моніторингу",
+                "Налаштування розкладу моніторингу",
+                "⚠️ Функція розкладу буде додана в наступних версіях.\n"
+                "Поки що моніторинг працює постійно з фіксованими інтервалами."
+            ),
+            reply_markup=get_admin_monitoring_keyboard()
+        )
+    
+    elif callback_data == "admin_monitoring_logs":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Логи моніторингу",
+                "Журнал подій моніторингу",
+                "⚠️ Детальні логи моніторингу будуть додані в наступних версіях.\n"
+                "Поки що перевіряйте консоль для логів системи."
+            ),
+            reply_markup=get_admin_monitoring_keyboard()
+        )
+    
+    # Обробники фільтрів та аналітики
+    elif callback_data == "admin_stats_filters":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Фільтри статистики",
+                "Розширені фільтри для статистики",
+                "⚠️ Функція фільтрів буде додана в наступних версіях.\n"
+                "Поки що доступна базова статистика."
+            ),
+            reply_markup=get_admin_search_keyboard()
+        )
+    
+    elif callback_data == "admin_date_filter":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Фільтр за датою",
+                "Фільтрація даних за часовим періодом",
+                "⚠️ Функція фільтрації за датою буде додана в наступних версіях.\n"
+                "Поки що доступні всі дані без фільтрації."
+            ),
+            reply_markup=get_admin_search_keyboard()
+        )
+    
+    elif callback_data == "admin_tag_filter":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Фільтр за тегами",
+                "Фільтрація даних за тегами",
+                "⚠️ Система тегів буде додана в наступних версіях.\n"
+                "Поки що використовуйте пошук за назвою проектів."
+            ),
+            reply_markup=get_admin_search_keyboard()
+        )
+    
+    elif callback_data == "admin_advanced_analytics":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Розширена аналітика",
+                "Детальний аналіз даних системи",
+                "⚠️ Розширена аналітика буде додана в наступних версіях.\n"
+                "Поки що доступна базова статистика в розділі 'Статистика та аналітика'."
+            ),
+            reply_markup=get_admin_search_keyboard()
+        )
+    
+    # Обробники відсутніх callback'ів
+    elif callback_data == "user_stats":
+        try:
+            stats = project_manager.get_statistics()
+            user_projects = project_manager.get_user_projects(user_id)
+            twitter_count = len([p for p in user_projects if p['platform'] == 'twitter'])
+            discord_count = len([p for p in user_projects if p['platform'] == 'discord'])
+            selenium_count = len(project_manager.get_selenium_accounts())
+            
+            stats_text = format_info_message(
+                "Ваша статистика",
+                f"📊 Ваші проекти:\n"
+                f"• Twitter: {twitter_count}\n"
+                f"• Discord: {discord_count}\n"
+                f"• Selenium: {selenium_count}\n\n"
+                f"🌐 Загальна статистика:\n"
+                f"• Всього користувачів: {stats.get('total_users', 0)}\n"
+                f"• Всього проектів: {stats.get('total_projects', 0)}\n"
+                f"• Активних сесій: {len(access_manager.user_sessions)}",
+                f"Час до закінчення сесії: {security_manager.get_session_time_left(user_id)} секунд"
+            )
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]])
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                format_error_message("Помилка статистики", str(e)),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]])
+            )
+    
+    elif callback_data == "change_channel":
+        user_states[user_id] = {'state': 'setting_forward_channel'}
+        await query.edit_message_text(
+            "✏️ Зміна каналу пересилання\n\n"
+            "Надішліть ID каналу або перешліть повідомлення з каналу:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="forward_settings")]])
+        )
+    
+    elif callback_data == "set_channel":
+        user_states[user_id] = {'state': 'setting_forward_channel'}
+        await query.edit_message_text(
+            "📝 Встановлення каналу пересилання\n\n"
+            "Надішліть ID каналу або перешліть повідомлення з каналу:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="forward_settings")]])
+        )
+    
+    elif callback_data.startswith("history_"):
+        # Отримуємо історію повідомлень
+        count = int(callback_data.split("_")[1])
+        await handle_discord_history(update, context, count)
+    
+    elif callback_data == "help_settings":
+        help_text = format_info_message(
+            "Налаштування допомоги",
+            "Як налаштувати бота під свої потреби",
+            "• Використовуйте розділ 'Налаштування' в головному меню\n"
+            "• Налаштуйте інтервали моніторингу\n"
+            "• Оберіть тему інтерфейсу\n"
+            "• Налаштуйте сповіщення\n"
+            "• Експортуйте свої дані при потребі"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="help")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    # Обробники адміністративних функцій
+    elif callback_data == "admin_system":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї панелі."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            format_info_message(
+                "Системне управління",
+                "Управління системними функціями бота",
+                "Тут ви можете керувати системними налаштуваннями, переглядати логи, створювати бекапи та виконувати інші адміністративні завдання."
+            ),
+            reply_markup=get_admin_system_keyboard()
+        )
+    
+    elif callback_data == "admin_user_activity":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                format_error_message("Доступ заборонено!", "Тільки адміністратор має доступ до цієї функції."),
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        try:
+            # Отримуємо активність користувачів
+            active_sessions = len(access_manager.user_sessions)
+            total_users = len(project_manager.data.get('users', {}))
+            
+            activity_text = format_info_message(
+                "Активність користувачів",
+                f"📊 Загальна інформація:\n"
+                f"• Всього користувачів: {total_users}\n"
+                f"• Активних сесій: {active_sessions}\n"
+                f"• Користувачів онлайн: {active_sessions}",
+                "Детальна статистика активності користувачів"
+            )
+            
+            await query.edit_message_text(
+                activity_text,
+                reply_markup=get_admin_users_keyboard()
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                format_error_message("Помилка отримання активності", str(e)),
+                reply_markup=get_admin_users_keyboard()
+        )
+    
+    # Нові обробники для покращеної адмін панелі
+    elif callback_data == "admin_search":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "🔍 **Пошук та фільтри**\n\n"
+            "🎯 **Центр поиска и фильтрации**\n\n"
+            "📋 **Доступные функции:**\n"
+            "• 🔍 Поиск пользователей\n"
+            "• 📋 Поиск проектов\n"
+            "• 📊 Фильтры статистики\n"
+            "• 📅 Фильтр по дате\n"
+            "• 🏷️ Фильтр по тегам\n"
+            "• 📈 Расширенная аналитика\n\n"
+            "Выберите нужную функцию:",
+            reply_markup=get_admin_search_keyboard(),
+        )
+    
+    elif callback_data == "admin_monitoring":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "📈 **Моніторинг системи**\n\n"
+            "🎯 **Центр мониторинга**\n\n"
+            "📋 **Доступные функции:**\n"
+            "• 📈 Статус мониторинга\n"
+            "• 🔔 Настройки уведомлений\n"
+            "• ⏰ Расписание мониторинга\n"
+            "• 📊 Логи мониторинга\n"
+            "• 🔄 Перезапуск мониторинга\n"
+            "• ⚡ Скорость отклика\n\n"
+            "Выберите нужную функцию:",
+            reply_markup=get_admin_monitoring_keyboard(),
+        )
+    
+    elif callback_data == "admin_settings":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "⚙️ **Налаштування системи**\n\n"
+            "🎯 **Центр настроек**\n\n"
+            "📋 **Доступные настройки:**\n"
+            "• 🔐 Настройки безопасности\n"
+            "• 🎨 Настройки интерфейса\n"
+            "• 📱 Настройки бота\n"
+            "• 🌐 Настройки сети\n"
+            "• 💾 Настройки хранения\n"
+            "• 🔧 Расширенные настройки\n\n"
+            "Выберите нужный раздел:",
+            reply_markup=get_admin_settings_keyboard(),
+        )
+    
+    elif callback_data == "admin_stats":
+        if not access_manager.is_admin(user_id):
+            await query.edit_message_text(
+                "❌ Доступ заборонено!",
+                reply_markup=get_main_menu_keyboard(user_id)
+            )
+            return
+        
+        await query.edit_message_text(
+            "📊 **Статистика та аналітика**\n\n"
+            "🎯 **Центр статистики**\n\n"
+            "📋 **Доступные отчеты:**\n"
+            "• 📊 Общая статистика\n"
+            "• 👥 Статистика пользователей\n"
+            "• 📋 Статистика проектов\n"
+            "• 📈 Графики и диаграммы\n"
+            "• 📅 Статистика за период\n"
+            "• 🔍 Детальная аналитика\n"
+            "• 📤 Экспорт данных\n\n"
+            "Выберите нужный отчет:",
+            reply_markup=get_admin_stats_keyboard(),
+        )
+    
     # Адмін керування пересиланням: дії з кнопок
     elif callback_data.startswith("admin_forward_enable_"):
         if not access_manager.is_admin(user_id):
@@ -2144,7 +3522,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"🟢 Пересилання увімкнено для `{target_id}`",
             reply_markup=get_admin_forward_keyboard(target_id),
-            parse_mode='Markdown'
         )
     elif callback_data.startswith("admin_forward_disable_"):
         if not access_manager.is_admin(user_id):
@@ -2154,7 +3531,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"🔴 Пересилання вимкнено для `{target_id}`",
             reply_markup=get_admin_forward_keyboard(target_id),
-            parse_mode='Markdown'
         )
     elif callback_data.startswith("admin_forward_status_"):
         if not access_manager.is_admin(user_id):
@@ -2166,7 +3542,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"📊 Статус пересилання для `{target_id}`\n\nСтатус: {'🟢 увімкнено' if enabled else '🔴 вимкнено'}\nКанал: `{channel}`",
             reply_markup=get_admin_forward_keyboard(target_id),
-            parse_mode='Markdown'
         )
     elif callback_data.startswith("admin_forward_test_"):
         if not access_manager.is_admin(user_id):
@@ -2177,7 +3552,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 f"❌ У користувача `{target_id}` не налаштований канал.",
                 reply_markup=get_admin_forward_keyboard(target_id),
-                parse_mode='Markdown'
             )
         else:
             try:
@@ -2189,14 +3563,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 data = {
                     'chat_id': normalize_chat_id(forward_channel),
                     'text': test_text,
-                    'parse_mode': 'Markdown'
                 }
                 r = requests.post(url, data=data, timeout=5)
                 if r.status_code == 200:
                     await query.edit_message_text(
                         f"✅ Тестове повідомлення надіслано у `{normalize_chat_id(forward_channel)}`",
                         reply_markup=get_admin_forward_keyboard(target_id),
-                        parse_mode='Markdown'
                     )
                 else:
                     await query.edit_message_text(
@@ -2217,14 +3589,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"📝 Перешліть повідомлення з потрібного каналу АБО введіть його ID для користувача `{target_id}`:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Скасувати", callback_data="admin_users")]]),
-            parse_mode='Markdown'
         )
 
 async def handle_project_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник створення проекту"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text
-    state_data = user_states[user_id]['data']
+    state_data: Dict[str, Any] = user_states[user_id]['data']
     
     if 'name' not in state_data:
         # Зберігаємо назву проекту
@@ -2249,6 +3623,9 @@ async def handle_project_creation(update: Update, context: ContextTypes.DEFAULT_
         
         # Додаємо проект
         if project_manager.add_project(user_id, state_data):
+            # Синхронізуємо монітори з новими проектами
+            sync_monitors_with_projects()
+            
             # Додаємо до відповідного моніторингу
             if state_data['platform'] == 'discord' and discord_monitor:
                 try:
@@ -2288,6 +3665,9 @@ async def handle_project_creation(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_forward_channel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник встановлення каналу для пересилання"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     
@@ -2325,6 +3705,9 @@ async def handle_forward_channel_setting(update: Update, context: ContextTypes.D
 @require_auth
 async def handle_admin_create_project_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Майстер створення проекту для іншого користувача (адмін)"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     admin_id = update.effective_user.id
     state = user_states.get(admin_id, {}).get('data', {})
     step = state.get('step', 'telegram_id')
@@ -2381,6 +3764,9 @@ async def handle_admin_create_project_for_user(update: Update, context: ContextT
         # Створюємо проект від імені target_id
         ok = project_manager.add_project(admin_id, project_data, target_user_id=state['target_id'])
         if ok:
+            # Синхронізуємо монітори з новими проектами
+            sync_monitors_with_projects()
+            
             # Додаємо у відповідний монітор одразу
             if state['platform'] == 'twitter':
                 username = extract_twitter_username(state['url'])
@@ -2399,6 +3785,9 @@ async def handle_admin_create_project_for_user(update: Update, context: ContextT
 
 async def handle_twitter_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник додавання Twitter акаунта"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     username = update.message.text.strip().replace('@', '')
     
@@ -2416,13 +3805,15 @@ async def handle_twitter_addition(update: Update, context: ContextTypes.DEFAULT_
         }
         
         if project_manager.add_project(user_id, project_data):
+            # Синхронізуємо монітори з новими проектами
+            sync_monitors_with_projects()
+            
             await update.message.reply_text(
                 f"✅ **Twitter акаунт успішно додано!**\n\n"
                 f"🐦 **Username:** @{username}\n"
                 f"🔗 **URL:** https://twitter.com/{username}\n\n"
                 f"Акаунт додано до моніторингу.",
                 reply_markup=get_twitter_projects_keyboard(user_id),
-                parse_mode='Markdown'
             )
         else:
             await update.message.reply_text(
@@ -2440,6 +3831,9 @@ async def handle_twitter_addition(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_discord_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник додавання Discord каналу"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     channel_id = update.message.text.strip()
     
@@ -2457,13 +3851,15 @@ async def handle_discord_addition(update: Update, context: ContextTypes.DEFAULT_
         }
         
         if project_manager.add_project(user_id, project_data):
+            # Синхронізуємо монітори з новими проектами
+            sync_monitors_with_projects()
+            
             await update.message.reply_text(
                 f"✅ **Discord канал успішно додано!**\n\n"
                 f"💬 **Channel ID:** {channel_id}\n"
                 f"🔗 **URL:** https://discord.com/channels/{channel_id}\n\n"
                 f"Канал додано до моніторингу.",
                 reply_markup=get_discord_projects_keyboard(user_id),
-                parse_mode='Markdown'
             )
         else:
             await update.message.reply_text(
@@ -2481,6 +3877,9 @@ async def handle_discord_addition(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_admin_user_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник створення користувача адміністратором"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     state_data = user_states[user_id]['data']
@@ -2541,8 +3940,8 @@ async def handle_admin_user_creation(update: Update, context: ContextTypes.DEFAU
             # Створюємо користувача
             created_user_id = access_manager.add_user(
                 state_data['telegram_id'],
-                state_data['username'],
-                password if password else None
+                state_data['username'] or "Unknown",
+                password or ""
             )
             
             if created_user_id:
@@ -2554,7 +3953,6 @@ async def handle_admin_user_creation(update: Update, context: ContextTypes.DEFAU
                     f"👑 **Роль:** Користувач\n\n"
                     f"Користувач може увійти в систему командою /login",
                     reply_markup=get_admin_users_keyboard(),
-                    parse_mode='Markdown'
                 )
             else:
                 await update.message.reply_text(
@@ -2578,6 +3976,9 @@ async def handle_admin_user_creation(update: Update, context: ContextTypes.DEFAU
 
 async def handle_admin_admin_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник створення адміністратора адміністратором"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     state_data = user_states[user_id]['data']
@@ -2638,8 +4039,8 @@ async def handle_admin_admin_creation(update: Update, context: ContextTypes.DEFA
             # Створюємо адміністратора
             created_user_id = access_manager.create_admin_user(
                 state_data['telegram_id'],
-                state_data['username'],
-                password if password else None
+                state_data['username'] or "Unknown",
+                password or ""
             )
             
             if created_user_id:
@@ -2651,7 +4052,6 @@ async def handle_admin_admin_creation(update: Update, context: ContextTypes.DEFA
                     f"👑 **Роль:** Адміністратор\n\n"
                     f"Адміністратор може увійти в систему командою /login",
                     reply_markup=get_admin_users_keyboard(),
-                    parse_mode='Markdown'
                 )
             else:
                 await update.message.reply_text(
@@ -2675,6 +4075,9 @@ async def handle_admin_admin_creation(update: Update, context: ContextTypes.DEFA
 
 async def handle_admin_user_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник пошуку користувачів адміністратором"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     
@@ -2713,7 +4116,6 @@ async def handle_admin_user_search(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(
             results_text,
             reply_markup=get_admin_users_keyboard(),
-            parse_mode='Markdown'
         )
         
     except Exception as e:
@@ -2728,6 +4130,9 @@ async def handle_admin_user_search(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_admin_user_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник видалення користувачів адміністратором"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     
@@ -2774,7 +4179,6 @@ async def handle_admin_user_deletion(update: Update, context: ContextTypes.DEFAU
                 f"👑 **Роль:** {'Адміністратор' if role == 'admin' else 'Користувач'}\n\n"
                 f"Користувач повністю видалений з системи.",
                 reply_markup=get_admin_users_keyboard(),
-                parse_mode='Markdown'
             )
         else:
             await update.message.reply_text(
@@ -2795,6 +4199,9 @@ async def handle_admin_user_deletion(update: Update, context: ContextTypes.DEFAU
 
 async def handle_admin_role_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник зміни ролі користувача адміністратором"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     state_data = user_states[user_id]['data']
@@ -2858,18 +4265,17 @@ async def handle_admin_role_change(update: Update, context: ContextTypes.DEFAULT
             
             # Змінюємо роль
             if access_manager.change_user_role(target_telegram_id, new_role):
-                old_role_text = "Адміністратор" if target_user.get('role') == 'admin' else "Користувач"
+                old_role_text = "Адміністратор" if target_user and target_user.get('role') == 'admin' else "Користувач"
                 new_role_text = "Адміністратор" if new_role == 'admin' else "Користувач"
                 
                 await update.message.reply_text(
                     f"🔄 **Роль успішно змінена!**\n\n"
-                    f"👤 **Username:** {target_user.get('username', 'Без імені')}\n"
+                    f"👤 **Username:** {target_user.get('username', 'Без імені') if target_user else 'Без імені'}\n"
                     f"🆔 **Telegram ID:** {target_telegram_id}\n"
                     f"👑 **Стара роль:** {old_role_text}\n"
                     f"👑 **Нова роль:** {new_role_text}\n\n"
                     f"Дозволи користувача оновлено автоматично.",
                     reply_markup=get_admin_users_keyboard(),
-                    parse_mode='Markdown'
                 )
             else:
                 await update.message.reply_text(
@@ -2892,6 +4298,9 @@ async def handle_admin_role_change(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_admin_password_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник скидання паролю користувача адміністратором"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     state_data = user_states[user_id]['data']
@@ -2941,17 +4350,16 @@ async def handle_admin_password_reset(update: Update, context: ContextTypes.DEFA
             target_user = state_data['target_user']
             
             # Скидаємо пароль
-            if access_manager.reset_user_password(target_telegram_id, new_password if new_password else None):
+            if access_manager.reset_user_password(target_telegram_id, new_password or ""):
                 password_text = new_password if new_password else "за замовчуванням"
                 
                 await update.message.reply_text(
                     f"🔐 **Пароль успішно скинуто!**\n\n"
-                    f"👤 **Username:** {target_user.get('username', 'Без імені')}\n"
+                    f"👤 **Username:** {target_user.get('username', 'Без імені') if target_user else 'Без імені'}\n"
                     f"🆔 **Telegram ID:** {target_telegram_id}\n"
                     f"🔐 **Новий пароль:** {password_text}\n\n"
                     f"Користувач буде розлогінений з усіх пристроїв.",
                     reply_markup=get_admin_users_keyboard(),
-                    parse_mode='Markdown'
                 )
             else:
                 await update.message.reply_text(
@@ -2974,6 +4382,9 @@ async def handle_admin_password_reset(update: Update, context: ContextTypes.DEFA
 
 async def handle_admin_system_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник скидання системи адміністратором"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     message_text = update.message.text.strip()
     
@@ -2993,7 +4404,6 @@ async def handle_admin_system_reset(update: Update, context: ContextTypes.DEFAUL
                     f"• Системні налаштування\n\n"
                     f"Система готова до нового використання.",
                     reply_markup=get_admin_system_keyboard(),
-                    parse_mode='Markdown'
                 )
             else:
                 await update.message.reply_text(
@@ -3024,6 +4434,9 @@ async def handle_admin_system_reset(update: Update, context: ContextTypes.DEFAUL
 
 async def handle_admin_forward_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник вибору користувача для керування пересиланням"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     admin_id = update.effective_user.id
     message_text = update.message.text.strip()
     try:
@@ -3043,13 +4456,15 @@ async def handle_admin_forward_select_user(update: Update, context: ContextTypes
         await update.message.reply_text(
             f"🔁 Пересилання для користувача `{target_id}`\n\nСтатус: {'🟢 увімкнено' if enabled else '🔴 вимкнено'}\nКанал: `{channel}`",
             reply_markup=get_admin_forward_keyboard(target_id),
-            parse_mode='Markdown'
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка: {e}")
 
 async def handle_admin_forward_set_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Адмін встановлює канал для вибраного користувача"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     admin_id = update.effective_user.id
     message_text = update.message.text.strip()
     state = user_states.get(admin_id, {}).get('data', {})
@@ -3068,8 +4483,7 @@ async def handle_admin_forward_set_channel(update: Update, context: ContextTypes
         channel_id_str = message_text
     if project_manager.set_forward_channel(target_id, channel_id_str):
         await update.message.reply_text(
-            f"✅ Канал збережено для `{target_id}`: `{normalize_chat_id(channel_id_str)}`",
-            parse_mode='Markdown',
+            f"✅ Канал збережено для {target_id}: {normalize_chat_id(channel_id_str)}",
             reply_markup=get_admin_forward_keyboard(target_id)
         )
     else:
@@ -3077,6 +4491,9 @@ async def handle_admin_forward_set_channel(update: Update, context: ContextTypes
 
 async def handle_selenium_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник додавання Selenium Twitter акаунта"""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+    
     user_id = update.effective_user.id
     username = update.message.text.strip().replace('@', '')
     
@@ -3088,13 +4505,15 @@ async def handle_selenium_addition(update: Update, context: ContextTypes.DEFAULT
         # Додаємо до проектного менеджера
         project_manager.add_selenium_account(username, user_id)
         
+        # Синхронізуємо монітори після додавання
+        sync_monitors_with_projects()
+        
         await update.message.reply_text(
             f"✅ **Selenium Twitter акаунт успішно додано!**\n\n"
             f"🚀 **Username:** @{username}\n"
             f"🔗 **URL:** https://x.com/{username}\n\n"
             f"Акаунт додано до Selenium моніторингу.",
             reply_markup=get_selenium_accounts_keyboard(),
-            parse_mode='Markdown'
         )
     except Exception as e:
         await update.message.reply_text(
@@ -3107,6 +4526,9 @@ async def handle_selenium_addition(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_channel_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник пінгу бота в каналі"""
+    if not update.message or not update.message.chat:
+        return
+        
     try:
         # Отримуємо інформацію про канал
         channel_id = update.message.chat.id
@@ -3146,7 +4568,6 @@ async def handle_channel_ping(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await context.bot.send_message(
                     chat_id=normalize_chat_id(str(channel_id)),
                     text=confirmation_text,
-                    parse_mode='Markdown'
                 )
                 
                 # Відправляємо повідомлення в особисті повідомлення
@@ -3187,6 +4608,9 @@ async def handle_channel_ping(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_discord_history(update: Update, context: ContextTypes.DEFAULT_TYPE, count: int) -> None:
     """Обробник перегляду історії Discord"""
+    if not update.callback_query or not update.effective_user:
+        return
+        
     query = update.callback_query
     user_id = update.effective_user.id
     
@@ -3354,8 +4778,11 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                 url_parts = message['url'].split('/')
                 if len(url_parts) >= 5:
                     guild_id = url_parts[4]
-                    server_name = f"Discord Server ({guild_id})"
-            except:
+                    # Отримуємо назву сервера з проекту користувача
+                    server_name = get_discord_server_name(channel_id, guild_id)
+                    logger.info(f"🏷️ Discord сервер для каналу {channel_id}: {server_name}")
+            except Exception as e:
+                logger.error(f"Помилка отримання назви сервера: {e}")
                 pass
             
             # Отримуємо зображення з повідомлення
@@ -3381,6 +4808,9 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                 tracked_users = get_users_tracking_discord_channel(channel_id)
                 channel_to_tracked_users[channel_id] = tracked_users
 
+            # Додаємо детальне логування для діагностики
+            logger.info(f"🔍 Discord канал {channel_id}: знайдено {len(tracked_users)} користувачів: {tracked_users}")
+
             # Фільтруємо тільки користувачів з налаштованим пересиланням
             users_with_forwarding: List[int] = []
             for user_id in tracked_users:
@@ -3389,9 +4819,21 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                 else:
                     forward_channel = project_manager.get_forward_channel(user_id)
                     user_to_forward_channel[user_id] = forward_channel
+                
+                logger.info(f"🔍 Користувач {user_id}: forward_channel = {forward_channel}")
+                
                 if forward_channel:
+                    # Очищаємо канал від зайвих символів
+                    clean_channel = forward_channel.split('/')[0] if '/' in forward_channel else forward_channel
                     users_with_forwarding.append(user_id)
+                    logger.info(f"✅ Користувач {user_id} додано до пересилання (канал: {clean_channel})")
+                else:
+                    logger.info(f"❌ Користувач {user_id} не має налаштованого каналу для пересилання")
+                    
+            logger.info(f"🔍 Discord канал {channel_id}: {len(users_with_forwarding)} користувачів з налаштованим пересиланням")
+            
             if not users_with_forwarding:
+                logger.info(f"⚠️ Discord канал {channel_id}: немає користувачів з налаштованим пересиланням")
                 continue
 
             # Не дублювати відправку, якщо кілька користувачів вказали той самий цільовий канал
@@ -3403,21 +4845,26 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                     forward_channel = user_to_forward_channel.get(user_id) or project_manager.get_forward_channel(user_id)
                     if not forward_channel:
                         continue
-                    if forward_channel in sent_targets:
+                    
+                    # Очищаємо канал від зайвих символів
+                    clean_channel = forward_channel.split('/')[0] if '/' in forward_channel else forward_channel
+                    
+                    if clean_channel in sent_targets:
                         # Уже відправлено в цей канал цю подію
                         continue
                     
                     # Швидка перевірка дублікатів
                     forward_key = f"forward_{channel_id}_{message_id}"
-                    if project_manager.is_message_sent(forward_key, forward_channel, user_id):
+                    if project_manager.is_message_sent(forward_key, clean_channel, user_id):
                         continue
+                    
+                    logger.info(f"📤 Відправляємо Discord повідомлення в канал {clean_channel} для користувача {user_id}")
                     
                     # Відправляємо текст повідомлення
                     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
                     data = {
-                        'chat_id': normalize_chat_id(forward_channel),
+                        'chat_id': normalize_chat_id(clean_channel),
                         'text': forward_text,
-                        'parse_mode': 'Markdown'
                     }
                     response = requests.post(url, data=data, timeout=3)
                     
@@ -3427,18 +4874,18 @@ def handle_discord_notifications_sync(new_messages: List[Dict]) -> None:
                             for i, image_url in enumerate(images[:5]):  # Максимум 5 зображень
                                 try:
                                     image_caption = f"📷 Discord зображення {i+1}/{len(images)}" if len(images) > 1 else "📷 Discord зображення"
-                                    download_and_send_image(image_url, forward_channel, image_caption)
+                                    download_and_send_image(image_url, clean_channel, image_caption)
                                     # Невелика затримка між зображеннями
                                     import time
                                     time.sleep(1)
                                 except Exception as e:
                                     logger.error(f"Помилка відправки Discord зображення: {e}")
                         
-                        project_manager.add_sent_message(forward_key, forward_channel, user_id)
-                        sent_targets.add(forward_channel)
-                        logger.info(f"✅ Переслано в канал {forward_channel} (користувач {user_id})")
+                        project_manager.add_sent_message(forward_key, clean_channel, user_id)
+                        sent_targets.add(clean_channel)
+                        logger.info(f"✅ Переслано в канал {clean_channel} (користувач {user_id})")
                     else:
-                        logger.error(f"❌ Помилка відправки в канал {forward_channel}: {response.status_code}")
+                        logger.error(f"❌ Помилка відправки в канал {clean_channel}: {response.status_code}")
                     
                 except Exception as e:
                     logger.error(f"Помилка обробки користувача {user_id}: {e}")
@@ -3477,6 +4924,22 @@ def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
             if tweet_id in global_sent_tweets[account]:
                 logger.info(f"Твіт {tweet_id} для {account} вже був відправлений, пропускаємо")
                 continue
+            
+            # Додаткова перевірка за контентом (для випадків коли ID може змінюватися)
+            tweet_text = tweet.get('text', '').strip()
+            if tweet_text:
+                # Створюємо хеш контенту для додаткової перевірки
+                import hashlib
+                content_hash = hashlib.md5(f"{account}_{tweet_text}".encode('utf-8')).hexdigest()[:12]
+                content_key = f"content_{content_hash}"
+                
+                # Перевіряємо чи такий контент вже був відправлений
+                if content_key in global_sent_tweets[account]:
+                    logger.info(f"Контент твіта для {account} вже був відправлений (хеш: {content_hash}), пропускаємо")
+                    continue
+                
+                # Додаємо хеш контенту до відправлених
+                global_sent_tweets[account].add(content_key)
             
             # Додаємо твіт до глобально відправлених
             global_sent_tweets[account].add(tweet_id)
@@ -3540,7 +5003,6 @@ def handle_twitter_notifications_sync(new_tweets: List[Dict]) -> None:
                     data = {
                         'chat_id': normalize_chat_id(forward_channel),
                         'text': forward_text,
-                        'parse_mode': 'Markdown'
                     }
                     response = requests.post(url, data=data, timeout=3)
                     
@@ -3580,8 +5042,12 @@ async def start_discord_monitoring():
     """Запустити моніторинг Discord"""
     global discord_monitor
     
-    if not discord_monitor or not DISCORD_AUTHORIZATION:
-        logger.warning("Discord authorization токен не налаштовано")
+    if not DISCORD_AUTHORIZATION:
+        logger.warning("Discord authorization токен не налаштовано - пропускаємо Discord моніторинг")
+        return
+        
+    if not discord_monitor:
+        logger.warning("Discord монітор не ініціалізовано - пропускаємо Discord моніторинг")
         return
         
     try:
@@ -3592,7 +5058,9 @@ async def start_discord_monitoring():
                     if project['platform'] == 'discord':
                         discord_monitor.add_channel(project['url'])
                         
-            logger.info(f"Запуск моніторингу Discord каналів")
+            channels_list = list(getattr(discord_monitor, 'channels', []))
+            logger.info(f"💬 Запуск Discord моніторингу для каналів: {channels_list}")
+            logger.info("🔄 Discord моніторинг активний та працює в фоновому режимі...")
             await discord_monitor.start_monitoring(handle_discord_notifications_sync, MONITORING_INTERVAL)
             
     except Exception as e:
@@ -3616,7 +5084,9 @@ async def start_twitter_monitoring():
                         if username:
                             twitter_monitor.add_account(username)
                             
-            logger.info(f"Запуск моніторингу Twitter акаунтів з HTML парсингом")
+            accounts_list = list(twitter_monitor.monitoring_accounts)
+            logger.info(f"🐦 Запуск Twitter API моніторингу для акаунтів: {accounts_list}")
+            logger.info("🔄 Twitter моніторинг активний та працює в фоновому режимі...")
             
             # Запускаємо власний цикл моніторингу з HTML парсингом
             while True:
@@ -3670,7 +5140,9 @@ async def start_selenium_twitter_monitoring():
         selenium_twitter_monitor.monitoring_active = True
         
         if selenium_twitter_monitor.monitoring_accounts:
-            logger.info(f"🚀 Запуск Selenium моніторингу Twitter акаунтів: {list(selenium_twitter_monitor.monitoring_accounts)}")
+            accounts_list = list(selenium_twitter_monitor.monitoring_accounts)
+            logger.info(f"🚀 Запуск Selenium Twitter моніторингу для акаунтів: {accounts_list}")
+            logger.info("🔄 Selenium моніторинг активний та працює в фоновому режимі...")
         else:
             logger.info("🚀 Selenium Twitter моніторинг запущено (очікує додавання акаунтів)")
         
@@ -3724,25 +5196,25 @@ async def start_selenium_twitter_monitoring():
         except:
             pass
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробник помилок"""
     logger.error(f"Update {update} caused error {context.error}")
 
-def check_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def check_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Перевірити закінчені сесії"""
     try:
         security_manager.check_expired_sessions(context.bot)
     except Exception as e:
         logger.error(f"Помилка перевірки сесій: {e}")
 
-def cleanup_old_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cleanup_old_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Очистити старі повідомлення"""
     try:
         project_manager.cleanup_old_messages(hours=24)
     except Exception as e:
         logger.error(f"Помилка очищення старих повідомлень: {e}")
 
-def cleanup_access_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cleanup_access_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Очистити закінчені сесії доступу"""
     try:
         access_manager.cleanup_expired_sessions()
@@ -3784,6 +5256,9 @@ def _get_time_ago(dt: datetime) -> str:
 @require_auth
 async def selenium_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для ручної авторизації в Twitter через Selenium"""
+    if not update.effective_user or not update.message:
+        return
+    
     global selenium_twitter_monitor
     
     if not selenium_twitter_monitor:
@@ -3804,6 +5279,9 @@ async def selenium_auth_command(update: Update, context: ContextTypes.DEFAULT_TY
 @require_auth
 async def selenium_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Додати акаунт для Selenium моніторингу"""
+    if not update.effective_user or not update.message:
+        return
+    
     global selenium_twitter_monitor
     user_id = update.effective_user.id
     
@@ -3815,6 +5293,9 @@ async def selenium_add_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Додаємо акаунт в базу даних
     if project_manager.add_selenium_account(username, user_id):
+        # Синхронізуємо монітори після додавання
+        sync_monitors_with_projects()
+        
         # Додаємо акаунт в поточний монітор
         if not selenium_twitter_monitor:
             selenium_twitter_monitor = SeleniumTwitterMonitor()
@@ -3826,7 +5307,6 @@ async def selenium_add_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"• Username: @{username}\n"
                 f"• Статус: Активний\n"
                 f"• Збережено в базі даних",
-                parse_mode='Markdown'
             )
         else:
             await update.message.reply_text(f"⚠️ Акаунт збережено в базі, але помилка додавання в монітор: @{username}")
@@ -3836,6 +5316,9 @@ async def selenium_add_command(update: Update, context: ContextTypes.DEFAULT_TYP
 @require_auth
 async def selenium_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Тестувати Selenium моніторинг"""
+    if not update.effective_user or not update.message:
+        return
+    
     global selenium_twitter_monitor
     
     if not context.args:
@@ -3861,7 +5344,7 @@ async def selenium_test_command(update: Update, context: ContextTypes.DEFAULT_TY
                 result_text += f"{i}. {text_preview}\n"
                 result_text += f"   🔗 [Перейти]({tweet['url']})\n\n"
                 
-            await update.message.reply_text(result_text, parse_mode='Markdown')
+            await update.message.reply_text(result_text, )
         else:
             await update.message.reply_text(f"❌ Твіти не знайдено для @{username}")
             
@@ -3871,6 +5354,9 @@ async def selenium_test_command(update: Update, context: ContextTypes.DEFAULT_TY
 @require_auth
 async def selenium_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запустити Selenium Twitter моніторинг"""
+    if not update.effective_user or not update.message:
+        return
+    
     global selenium_twitter_monitor
     
     if not selenium_twitter_monitor:
@@ -3889,11 +5375,14 @@ async def selenium_start_command(update: Update, context: ContextTypes.DEFAULT_T
     # Старт після синхронізації — на всяк випадок
     sync_monitors_with_projects()
     
-    await update.message.reply_text("🚀 **Selenium Twitter моніторинг запущено!**\n\nБот буде перевіряти нові твіти кожні 30 секунд.", parse_mode='Markdown')
+    await update.message.reply_text("🚀 **Selenium Twitter моніторинг запущено!**\n\nБот буде перевіряти нові твіти кожні 30 секунд.", )
 
 @require_auth
 async def selenium_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Зупинити Selenium Twitter моніторинг"""
+    if not update.effective_user or not update.message:
+        return
+    
     global selenium_twitter_monitor
     
     if selenium_twitter_monitor:
@@ -3901,12 +5390,15 @@ async def selenium_stop_command(update: Update, context: ContextTypes.DEFAULT_TY
         await selenium_twitter_monitor.__aexit__(None, None, None)
         selenium_twitter_monitor = None
     
-    await update.message.reply_text("⏹️ **Selenium Twitter моніторинг зупинено!**", parse_mode='Markdown')
+    await update.message.reply_text("⏹️ **Selenium Twitter моніторинг зупинено!**", )
 
 # Менеджер акаунтів
 @require_auth
 async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показати всі акаунти для моніторингу"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     
     # Отримуємо проекти користувача
@@ -3935,8 +5427,9 @@ async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if twitter_projects:
         text += "🐦 **Звичайні Twitter/X акаунти:**\n"
         for i, project in enumerate(twitter_projects, 1):
-            username = extract_twitter_username(project['url'])
-            text += f"{i}. @{username} ({project['name']})\n"
+            twitter_username: Optional[str] = extract_twitter_username(project['url'])
+            if twitter_username:
+                text += f"{i}. @{twitter_username} ({project['name']})\n"
         text += "\n"
     
     # Discord канали
@@ -3962,11 +5455,14 @@ async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     text += "• /remove_discord channel_id - видалити Discord канал\n"
     text += "• /accounts - показати цей список"
     
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text, )
 
 @require_auth
 async def remove_twitter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видалити Twitter акаунт з моніторингу"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     
     if not context.args:
@@ -3991,6 +5487,9 @@ async def remove_twitter_command(update: Update, context: ContextTypes.DEFAULT_T
     
     # Видаляємо проект
     if project_manager.remove_project(user_id, project_to_remove['id']):
+        # Синхронізуємо монітори після видалення
+        sync_monitors_with_projects()
+        
         await update.message.reply_text(f"✅ Twitter акаунт @{username} видалено з моніторингу.")
         
         # Також видаляємо з активних моніторів
@@ -4014,6 +5513,9 @@ async def remove_twitter_command(update: Update, context: ContextTypes.DEFAULT_T
 @require_auth
 async def selenium_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видалити Selenium Twitter акаунт з моніторингу"""
+    if not update.effective_user or not update.message:
+        return
+    
     global selenium_twitter_monitor
     
     if not context.args:
@@ -4024,6 +5526,9 @@ async def selenium_remove_command(update: Update, context: ContextTypes.DEFAULT_
     
     # Видаляємо з бази даних
     if project_manager.remove_selenium_account(username):
+        # Синхронізуємо монітори після видалення
+        sync_monitors_with_projects()
+        
         # Видаляємо з поточного монітора
         if selenium_twitter_monitor and username in selenium_twitter_monitor.monitoring_accounts:
             selenium_twitter_monitor.monitoring_accounts.remove(username)
@@ -4035,7 +5540,6 @@ async def selenium_remove_command(update: Update, context: ContextTypes.DEFAULT_
             f"• Username: @{username}\n"
             f"• Видалено з бази даних\n"
             f"• Видалено з поточного монітора",
-            parse_mode='Markdown'
         )
     else:
         await update.message.reply_text(f"❌ Акаунт @{username} не знайдено в Selenium моніторингу")
@@ -4043,6 +5547,9 @@ async def selenium_remove_command(update: Update, context: ContextTypes.DEFAULT_
 @require_auth
 async def remove_discord_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видалити Discord канал з моніторингу"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     
     if not context.args:
@@ -4067,6 +5574,9 @@ async def remove_discord_command(update: Update, context: ContextTypes.DEFAULT_T
     
     # Видаляємо проект
     if project_manager.remove_project(user_id, project_to_remove['id']):
+        # Синхронізуємо монітори після видалення
+        sync_monitors_with_projects()
+        
         await update.message.reply_text(f"✅ Discord канал {channel_id} видалено з моніторингу.")
         
         # Також видаляємо з Discord монітора якщо він активний
@@ -4081,20 +5591,34 @@ async def remove_discord_command(update: Update, context: ContextTypes.DEFAULT_T
     else:
         await update.message.reply_text(f"❌ Помилка видалення Discord каналу {channel_id}.")
 
-def extract_twitter_username(url: str) -> str:
-    """Витягти username з Twitter URL"""
-    import re
-    match = re.search(r'twitter\.com/([^/?]+)', url)
-    return match.group(1) if match else url
 
 def extract_discord_channel_id(url: str) -> str:
     """Витягти channel_id з Discord URL"""
-    import re
-    match = re.search(r'discord\.com/channels/\d+/(\d+)', url)
-    return match.group(1) if match else url
+    try:
+        if not url:
+            return ""
+        
+        import re
+        # Спробуємо знайти channel_id в URL
+        match = re.search(r'discord\.com/channels/\d+/(\d+)', url)
+        if match:
+            return match.group(1)
+        
+        # Якщо це просто ID (тільки цифри)
+        if url.isdigit():
+            return url
+            
+        logger.warning(f"Не вдалося витягти Discord channel_id з: {url}")
+        return ""
+    except Exception as e:
+        logger.error(f"Помилка витягування Discord channel_id з '{url}': {e}")
+        return ""
 
 async def admin_create_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для створення нового користувача (тільки для адміністратора)"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     
     # Перевіряємо чи користувач є адміністратором
@@ -4102,7 +5626,6 @@ async def admin_create_user_command(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(
             "❌ **Доступ заборонено!**\n\n"
             "Тільки адміністратор може створювати нових користувачів.",
-            parse_mode='Markdown'
         )
         return
     
@@ -4111,7 +5634,6 @@ async def admin_create_user_command(update: Update, context: ContextTypes.DEFAUL
             "📝 **Створення нового користувача**\n\n"
             "Використання: /admin_create_user <telegram_id> <username> [password]\n\n"
             "Приклад: /admin_create_user 123456789 JohnDoe mypassword",
-            parse_mode='Markdown'
         )
         return
     
@@ -4121,7 +5643,7 @@ async def admin_create_user_command(update: Update, context: ContextTypes.DEFAUL
         password = context.args[2] if len(context.args) > 2 else None
         
         # Створюємо користувача
-        user_id_created = access_manager.add_user(telegram_id, username, password)
+        user_id_created = access_manager.add_user(telegram_id, username or "Unknown", password or "")
         
         if user_id_created:
             await update.message.reply_text(
@@ -4131,12 +5653,10 @@ async def admin_create_user_command(update: Update, context: ContextTypes.DEFAUL
                 f"🔐 **Пароль:** {password or 'за замовчуванням'}\n"
                 f"👑 **Роль:** Користувач\n\n"
                 f"Користувач може увійти в систему командою /login",
-                parse_mode='Markdown'
             )
         else:
             await update.message.reply_text(
                 "❌ Помилка створення користувача (можливо, користувач вже існує).",
-                parse_mode='Markdown'
             )
             
     except ValueError:
@@ -4144,16 +5664,17 @@ async def admin_create_user_command(update: Update, context: ContextTypes.DEFAUL
             "❌ **Неправильний формат!**\n\n"
             "Telegram ID повинен бути числом.\n"
             "Приклад: /admin_create_user 123456789 JohnDoe",
-            parse_mode='Markdown'
         )
     except Exception as e:
         await update.message.reply_text(
             f"❌ Помилка створення користувача: {str(e)}",
-            parse_mode='Markdown'
         )
 
 async def admin_create_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для створення нового адміністратора (тільки для адміністратора)"""
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     
     # Перевіряємо чи користувач є адміністратором
@@ -4161,7 +5682,6 @@ async def admin_create_admin_command(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text(
             "❌ **Доступ заборонено!**\n\n"
             "Тільки адміністратор може створювати інших адміністраторів.",
-            parse_mode='Markdown'
         )
         return
     
@@ -4170,7 +5690,6 @@ async def admin_create_admin_command(update: Update, context: ContextTypes.DEFAU
             "📝 **Створення нового адміністратора**\n\n"
             "Використання: /admin_create_admin <telegram_id> <username> [password]\n\n"
             "Приклад: /admin_create_admin 123456789 AdminJohn adminpass123",
-            parse_mode='Markdown'
         )
         return
     
@@ -4180,7 +5699,7 @@ async def admin_create_admin_command(update: Update, context: ContextTypes.DEFAU
         password = context.args[2] if len(context.args) > 2 else None
         
         # Створюємо адміністратора
-        user_id_created = access_manager.create_admin_user(telegram_id, username, password)
+        user_id_created = access_manager.create_admin_user(telegram_id, username or "Unknown", password or "")
         
         if user_id_created:
             await update.message.reply_text(
@@ -4190,12 +5709,10 @@ async def admin_create_admin_command(update: Update, context: ContextTypes.DEFAU
                 f"🔐 **Пароль:** {password or 'за замовчуванням'}\n"
                 f"👑 **Роль:** Адміністратор\n\n"
                 f"Адміністратор може увійти в систему командою /login",
-                parse_mode='Markdown'
             )
         else:
             await update.message.reply_text(
                 "❌ Помилка створення адміністратора (можливо, користувач вже існує).",
-                parse_mode='Markdown'
             )
             
     except ValueError:
@@ -4203,16 +5720,17 @@ async def admin_create_admin_command(update: Update, context: ContextTypes.DEFAU
             "❌ **Неправильний формат!**\n\n"
             "Telegram ID повинен бути числом.\n"
             "Приклад: /admin_create_admin 123456789 AdminJohn",
-            parse_mode='Markdown'
         )
     except Exception as e:
         await update.message.reply_text(
             f"❌ Помилка створення адміністратора: {str(e)}",
-            parse_mode='Markdown'
         )
 
 async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда для перегляду всіх користувачів (тільки для адміністратора)"""
+    if not update.effective_user or not update.message:
+        return
+        
     user_id = update.effective_user.id
     
     # Перевіряємо чи користувач є адміністратором
@@ -4220,7 +5738,6 @@ async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             "❌ **Доступ заборонено!**\n\n"
             "Тільки адміністратор може переглядати список користувачів.",
-            parse_mode='Markdown'
         )
         return
     
@@ -4231,7 +5748,6 @@ async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(
                 "👥 **Список користувачів**\n\n"
                 "Користувачів не знайдено.",
-                parse_mode='Markdown'
             )
             return
         
@@ -4253,13 +5769,13 @@ async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         users_text += f"**Всього користувачів:** {len(all_users)}"
         
-        await update.message.reply_text(users_text, parse_mode='Markdown')
+        await update.message.reply_text(users_text, )
         
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ **Помилка отримання списку користувачів**\n\n{str(e)}",
-            parse_mode='Markdown'
-        )
+        if update.message:
+            await update.message.reply_text(
+                f"❌ **Помилка отримання списку користувачів**\n\n{str(e)}",
+            )
 
 def main() -> None:
     """Головна функція"""
@@ -4316,37 +5832,59 @@ def main() -> None:
     
     # Додаємо періодичну перевірку сесій (кожну хвилину)
     job_queue = application.job_queue
-    job_queue.run_repeating(check_sessions, interval=300, first=300)  # Кожні 5 хвилин
+    if job_queue:
+        job_queue.run_repeating(check_sessions, interval=300, first=300)  # Кожні 5 хвилин
+        
+        # Додаємо періодичне очищення старих повідомлень (кожні 2 години)
+        job_queue.run_repeating(cleanup_old_messages, interval=7200, first=7200)
+        
+        # Додаємо періодичне очищення сесій доступу (кожні 30 хвилин)
+        job_queue.run_repeating(cleanup_access_sessions, interval=1800, first=1800)  # Кожні 30 хвилин
     
-    # Додаємо періодичне очищення старих повідомлень (кожні 2 години)
-    job_queue.run_repeating(cleanup_old_messages, interval=7200, first=7200)
+        # Додаємо періодичну синхронізацію моніторів (кожні 5 хвилин)
+        job_queue.run_repeating(lambda context: sync_monitors_with_projects(), interval=300, first=300)  # Кожні 5 хвилин
     
-    # Додаємо періодичне очищення сесій доступу (кожні 30 хвилин)
-    job_queue.run_repeating(cleanup_access_sessions, interval=1800, first=1800)  # Кожні 30 хвилин
+    logger.info("🚀 Бот запускається...")
     
-    logger.info("Бот запускається...")
+    # Перевіряємо конфігурацію
+    logger.info("🔧 Перевірка конфігурації:")
+    logger.info(f"   🤖 BOT_TOKEN: {'✅ Є' if BOT_TOKEN else '❌ Відсутній'}")
+    logger.info(f"   🐦 TWITTER_AUTH_TOKEN: {'✅ Є' if TWITTER_AUTH_TOKEN else '❌ Відсутній'}")
+    logger.info(f"   💬 DISCORD_AUTHORIZATION: {'✅ Є' if DISCORD_AUTHORIZATION else '❌ Відсутній'}")
     
-    # Запускаємо Discord моніторинг в окремому потоці
-    if discord_monitor and DISCORD_AUTHORIZATION:
-        import threading
-        discord_thread = threading.Thread(target=lambda: asyncio.run(start_discord_monitoring()))
-        discord_thread.daemon = True
-        discord_thread.start()
-        logger.info("Discord моніторинг запущено")
+    # Показуємо статистику існуючих проектів
+    try:
+        total_users = len(project_manager.data.get('users', {}))
+        total_projects = 0
+        twitter_projects = 0
+        discord_projects = 0
+        
+        for user_id, projects in project_manager.data.get('projects', {}).items():
+            total_projects += len(projects)
+            for project in projects:
+                if project.get('platform') == 'twitter':
+                    twitter_projects += 1
+                elif project.get('platform') == 'discord':
+                    discord_projects += 1
+        
+        logger.info(f"📊 Статистика системи:")
+        logger.info(f"   👥 Користувачів: {total_users}")
+        logger.info(f"   📋 Всього проектів: {total_projects}")
+        logger.info(f"   🐦 Twitter проектів: {twitter_projects}")
+        logger.info(f"   💬 Discord проектів: {discord_projects}")
+        
+        if total_projects > 0:
+            logger.info("✅ Знайдено існуючі проекти - будуть автоматично запущені для моніторингу")
+        else:
+            logger.info("ℹ️ Проекти не знайдено - монітори будуть готові до додавання проектів")
+    except Exception as e:
+        logger.error(f"Помилка отримання статистики проектів: {e}")
     
-    # Запускаємо Twitter моніторинг в окремому потоці
-    if twitter_monitor and TWITTER_AUTH_TOKEN:
-        import threading
-        twitter_thread = threading.Thread(target=lambda: asyncio.run(start_twitter_monitoring()))
-        twitter_thread.daemon = True
-        twitter_thread.start()
-        logger.info("Twitter моніторинг запущено")
-    
-    # Автоматично запускаємо Selenium Twitter моніторинг
+    # Ініціалізуємо Selenium Twitter моніторинг
     global selenium_twitter_monitor
     selenium_twitter_monitor = SeleniumTwitterMonitor()
     
-    # Завантажуємо збережені акаунти
+    # Завантажуємо збережені Selenium акаунти
     saved_accounts = project_manager.get_selenium_accounts()
     if saved_accounts:
         logger.info(f"Завантажено {len(saved_accounts)} збережених Selenium акаунтів: {saved_accounts}")
@@ -4354,16 +5892,34 @@ def main() -> None:
             selenium_twitter_monitor.add_account(username)
         logger.info(f"✅ Selenium Twitter моніторинг готовий з {len(saved_accounts)} акаунтами")
     else:
-        logger.info("ℹ️ Збережених Selenium акаунтів не знайдено - моніторинг буде запущено без акаунтів")
+        logger.info("ℹ️ Збережених Selenium акаунтів не знайдено")
     
     # На старті проводимо синхронізацію моніторів з проектами/базою
+    # Це автоматично запустить всі монітори для існуючих проектів
+    logger.info("🔄 Синхронізуємо монітори з існуючими проектами...")
     sync_monitors_with_projects()
 
-    # Запускаємо Selenium моніторинг в окремому потоці
-    selenium_thread = threading.Thread(target=lambda: asyncio.run(start_selenium_twitter_monitoring()))
-    selenium_thread.daemon = True
-    selenium_thread.start()
-    logger.info("🚀 Selenium Twitter моніторинг автоматично запущено")
+    # Показуємо поточний стан моніторингу
+    try:
+        twitter_accounts = len(getattr(twitter_monitor, 'monitoring_accounts', set())) if twitter_monitor else 0
+        selenium_accounts = len(getattr(selenium_twitter_monitor, 'monitoring_accounts', set())) if selenium_twitter_monitor else 0
+        discord_channels = len(getattr(discord_monitor, 'channels', [])) if discord_monitor else 0
+        
+        logger.info("📈 Поточний стан моніторингу:")
+        logger.info(f"   🐦 Twitter API: {twitter_accounts} акаунтів")
+        logger.info(f"   🚀 Selenium Twitter: {selenium_accounts} акаунтів") 
+        logger.info(f"   💬 Discord: {discord_channels} каналів")
+        
+        total_monitoring = twitter_accounts + selenium_accounts + discord_channels
+        if total_monitoring > 0:
+            logger.info(f"✅ Всього активних моніторів: {total_monitoring}")
+            logger.info("🎯 Бот готовий до роботи та автоматично моніторить всі налаштовані проекти!")
+        else:
+            logger.info("ℹ️ Монітори готові, очікуємо додавання проектів")
+    except Exception as e:
+        logger.error(f"Помилка отримання стану моніторингу: {e}")
+    
+    logger.info("✅ Синхронізація завершена, всі монітори запущені автоматично")
     
     # Запускаємо бота
     try:
